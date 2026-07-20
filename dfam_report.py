@@ -36,7 +36,58 @@ def face_severity_index(mesh, violations, dz, halo=0.4):
     return idx
 
 
-def _feature_payload(features):
+def _rings(geom, tol=0.08):
+    """Flatten a shapely (Multi)Polygon to a list of [x,y] rings
+    (exteriors + holes), lightly simplified for a compact payload."""
+    if geom is None or geom.is_empty:
+        return []
+    try:
+        geom = geom.simplify(tol, preserve_topology=True)
+    except Exception:
+        pass
+    polys = geom.geoms if hasattr(geom, "geoms") else [geom]
+    rings = []
+    for p in polys:
+        if p.is_empty or not hasattr(p, "exterior"):
+            continue
+        for ring in [p.exterior, *p.interiors]:
+            pts = [[round(x, 2), round(y, 2)] for x, y in ring.coords]
+            if len(pts) >= 3:
+                rings.append(pts)
+    return rings
+
+
+def _transition_diagram(mesh, feature, dz, angle):
+    """Cross-section evidence for one defect: the supporting slice below,
+    the 45-deg allowed envelope grown from it, this slice, and the
+    material poking past the envelope. Renders in the report as a 2-D
+    'here's why, and here's the allowed shape' panel."""
+    from dfam_audit import slice_region, GROW_SLOP
+    try:
+        layer = max(feature["layers"], key=lambda v: v.area)
+        zc = layer.z
+        cur = slice_region(mesh, zc)
+        prev = slice_region(mesh, zc - dz)
+        if cur is None or cur.is_empty:
+            return None
+        grow = dz * np.tan(np.radians(angle)) + GROW_SLOP
+        env = prev.buffer(grow) if (prev is not None and not prev.is_empty) \
+            else cur.buffer(0).difference(cur)   # empty
+        bad = cur.difference(env) if not env.is_empty else cur
+        ref = cur.union(env) if not env.is_empty else cur
+        b = ref.bounds
+        return {
+            "z": round(zc, 1), "zprev": round(zc - dz, 1),
+            "prev": _rings(prev), "cur": _rings(cur),
+            "env": _rings(env), "bad": _rings(bad),
+            "bbox": [round(b[0], 1), round(b[1], 1),
+                     round(b[2], 1), round(b[3], 1)],
+        }
+    except Exception:
+        return None
+
+
+def _feature_payload(features, mesh=None, dz=0.4, angle=45.0):
     out = []
     for k, f in enumerate(features):
         g = f.get("geom")
@@ -64,12 +115,14 @@ def _feature_payload(features):
                        round((f["zlo"] + f["zhi"]) / 2, 1)],
             "radius": round(rad / 2 + 1.5, 1),
             "repairs": f.get("repairs", []),
+            "diagram": (_transition_diagram(mesh, f, dz, angle)
+                        if mesh is not None else None),
         })
     return out
 
 
-def write_report(mesh, violations, features, out_path, meta=None):
-    """Emit the self-contained HTML report. Returns out_path."""
+def render_report(mesh, violations, features, meta=None):
+    """Build the self-contained report HTML and return it as a string."""
     meta = meta or {}
     dz = meta.get("dz", 0.4)
     fidx = face_severity_index(mesh, violations, dz)
@@ -80,7 +133,8 @@ def write_report(mesh, violations, features, out_path, meta=None):
         "faceSev": fidx.tolist(),
         "bounds": [list(np.round(mesh.bounds[0], 1)),
                    list(np.round(mesh.bounds[1], 1))],
-        "features": _feature_payload(features),
+        "features": _feature_payload(features, mesh, dz,
+                                     meta.get("angle", 45.0)),
         "meta": {
             "part": meta.get("part", "part"),
             "angle": meta.get("angle", 45.0),
@@ -88,14 +142,22 @@ def write_report(mesh, violations, features, out_path, meta=None):
             "bed": meta.get("bed"),
             "zones": meta.get("zones", []),
             "passed": len(violations) == 0,
+            "status": meta.get("status"),
+            "profile": meta.get("profile"),
+            "health": meta.get("health", []),
             "counts": {s: sum(1 for f in features if f["severity"] == s)
                        for s in ("fail", "judge", "tolerable")},
             "nviol": len(violations),
         },
     }
     from vendor_three import three_js
-    html = _TEMPLATE.replace("__THREE__", three_js()) \
+    return _TEMPLATE.replace("__THREE__", three_js()) \
                     .replace("__DATA__", json.dumps(data))
+
+
+def write_report(mesh, violations, features, out_path, meta=None):
+    """Emit the self-contained HTML report to a file. Returns the path."""
+    html = render_report(mesh, violations, features, meta)
     with open(out_path, "w") as fh:
         fh.write(html)
     return out_path
@@ -132,6 +194,11 @@ _TEMPLATE = r"""<!DOCTYPE html>
   .stat.tol b{color:var(--tol)}
   .pass{background:var(--card);border:1px solid var(--ok);color:var(--ok);
         border-radius:8px;padding:12px;text-align:center;font-weight:600}
+  .statusbar{background:var(--card);border:1px solid var(--line);
+        border-left-width:4px;border-radius:8px;padding:9px 12px;
+        margin-bottom:10px}
+  .statusbar b{font-size:13px;letter-spacing:.4px;display:block}
+  .statusbar span{color:var(--dim);font-size:11.5px}
   .card{background:var(--card);border:1px solid var(--line);
         border-radius:8px;padding:10px 12px;margin-bottom:8px;
         cursor:pointer;transition:border-color .15s}
@@ -153,6 +220,15 @@ _TEMPLATE = r"""<!DOCTYPE html>
   #hint{position:absolute;right:12px;bottom:10px;color:var(--dim);
         font-size:11px;background:rgba(20,23,28,.7);padding:4px 10px;
         border-radius:6px}
+  #slice{position:absolute;left:14px;bottom:14px;width:280px;
+         background:rgba(28,33,41,.95);border:1px solid var(--line);
+         border-radius:9px;padding:11px 12px;display:none}
+  #slice h4{margin:0 0 2px;font-size:12px}
+  #slice .cap{color:var(--dim);font-size:10.5px;margin-bottom:7px}
+  #slice svg{width:100%;height:170px;background:#0f1216;border-radius:6px}
+  #slice .leg{font-size:10px;color:var(--dim);margin-top:7px;line-height:1.7}
+  #slice .sw{display:inline-block;width:16px;height:0;vertical-align:middle;
+         margin:0 5px 0 9px}
 </style>
 </head>
 <body>
@@ -195,26 +271,43 @@ _TEMPLATE = r"""<!DOCTYPE html>
     Make stalagmites, not stalactites.</div>
   </div>
 </div>
-<div id="view"><div id="hint">drag rotate &middot; wheel zoom &middot; right-drag pan</div></div>
+<div id="view"><div id="hint">drag rotate &middot; wheel zoom &middot; right-drag pan</div><div id="slice"></div></div>
 <script id="data" type="application/json">__DATA__</script>
 <script>
 const D = JSON.parse(document.getElementById('data').textContent);
 const M = D.meta;
 document.getElementById('sub').textContent =
   `${M.part} - ${M.angle} deg rule, ${M.dz}mm layers` +
+  (M.profile ? ` - profile: ${M.profile}` : '') +
   (M.zones.length ? ` - ${M.zones.length} helix zone(s) excluded` : '');
+if (M.health && M.health.length) {
+  const h = document.createElement('div');
+  h.style.cssText = 'color:#e0a24a;font-size:11px;margin:2px 0 12px';
+  h.textContent = 'mesh health: ' + M.health.join('; ');
+  document.getElementById('sub').after(h);
+}
 
 // ---- panel
+const STATUS_INFO = {
+  PASS:             {c:'#3fb96a', t:'every layer supported; no concerns.'},
+  PASS_WITH_LIMITS: {c:'#e6c828', t:'prints as-is; only within-allowance ledges or surface notes.'},
+  REVIEW:           {c:'#f08c14', t:'printable, but contains judged bridge(s) - eyeball first.'},
+  FAIL:             {c:'#dc1e1e', t:'will NOT print as oriented; needs a fix or reorient.'},
+};
 const stats = document.getElementById('stats');
-if (M.passed) {
-  stats.innerHTML = '<div class="pass">PASS - every layer supported</div>';
-} else {
-  stats.innerHTML = '<div class="stats">' +
+const st = M.status || (M.passed ? 'PASS' : 'FAIL');
+const si = STATUS_INFO[st] || STATUS_INFO.FAIL;
+let html = `<div class="statusbar" style="border-color:${si.c}">` +
+  `<b style="color:${si.c}">${st.replace(/_/g,' ')}</b>` +
+  `<span>${si.t}</span></div>`;
+if (!M.passed) {
+  html += '<div class="stats">' +
     `<div class="stat fail"><b>${M.counts.fail}</b><i>fail</i></div>` +
     `<div class="stat judge"><b>${M.counts.judge}</b><i>judge</i></div>` +
     `<div class="stat tol"><b>${M.counts.tolerable}</b><i>tolerable</i></div>` +
     '</div>';
 }
+stats.innerHTML = html;
 const list = document.getElementById('defects');
 D.features.forEach(f => {
   const c = document.createElement('div');
@@ -318,6 +411,47 @@ renderer.domElement.addEventListener('wheel', e => {
            goal.r * (e.deltaY > 0 ? 1.12 : 0.89)));
 }, {passive: false});
 
+function ringsToPath(rings, tf) {
+  return rings.map(r => 'M' + r.map((p,i) =>
+    (i?'L':'') + tf(p).join(' ')).join(' ') + 'Z').join(' ');
+}
+function drawSlice(f) {
+  const el = document.getElementById('slice');
+  const d = f.diagram;
+  if (!d) { el.style.display = 'none'; return; }
+  const W = 256, H = 156, pad = 12;
+  const [x0,y0,x1,y1] = d.bbox;
+  const s = Math.min((W-2*pad)/Math.max(x1-x0,1e-3),
+                     (H-2*pad)/Math.max(y1-y0,1e-3));
+  const ox = (W - (x1-x0)*s)/2, oy = (H - (y1-y0)*s)/2;
+  // world (x,y up) -> svg (y down)
+  const tf = p => [ +(ox + (p[0]-x0)*s).toFixed(1),
+                    +(H - oy - (p[1]-y0)*s).toFixed(1) ];
+  const P = (rings, attr) => rings.length ?
+    `<path d="${ringsToPath(rings, tf)}" fill-rule="evenodd" ${attr}/>` : '';
+  const svg =
+    `<svg viewBox="0 0 ${W} ${H}">` +
+    P(d.prev, 'fill="#3a4658" opacity="0.55"') +          // support below
+    P(d.env,  'fill="none" stroke="#4f7fd0" stroke-width="1.3" stroke-dasharray="4 3"') + // allowed envelope
+    P(d.cur,  'fill="none" stroke="#c9d2de" stroke-width="1.2"') +   // this slice
+    P(d.bad,  'fill="#dc1e1e" opacity="0.72"') +           // beyond envelope
+    `</svg>`;
+  el.innerHTML =
+    `<h4>Why: the transition at z=${d.z}</h4>` +
+    `<div class="cap">this slice vs its support at z=${d.zprev} ` +
+    `(&Delta;${(d.z-d.zprev).toFixed(1)}mm)</div>` + svg +
+    `<div class="leg">` +
+    `<span class="sw" style="border-top:2px dashed #4f7fd0"></span>allowed 45&deg; envelope` +
+    `<span class="sw" style="border-top:2px solid #c9d2de"></span>this slice<br>` +
+    `<span class="sw" style="background:#3a4658;height:8px;border-radius:2px"></span>support below` +
+    `<span class="sw" style="background:#dc1e1e;height:8px;border-radius:2px"></span>past envelope` +
+    `</div>` +
+    (f.severity === 'fail'
+      ? `<div class="cap" style="margin-top:7px;color:#4f7fd0">` +
+        `Fix: morph the red back within the dashed envelope, or ground it ` +
+        `to solid below.</div>` : '');
+  el.style.display = 'block';
+}
 function select(f) {
   document.querySelectorAll('.card').forEach(c =>
     c.classList.remove('sel'));
@@ -328,6 +462,7 @@ function select(f) {
   marker.position.set(f.center[0], f.center[1], f.center[2]);
   marker.scale.setScalar(f.radius);
   marker.visible = true;
+  drawSlice(f);
 }
 
 function resize() {

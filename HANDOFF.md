@@ -222,6 +222,152 @@ constant-area lobe") now exists: `detect_helix_zones()` + `--auto-ex`.
 - GETTING_STARTED.md added (plain-English guide incl. GitHub Desktop
   publishing path).
 
+## Status 2026-07-20 (v0.14.0) — machine interface: --json + to_dict()
+
+For "before I ship" automation. `result_dict()` in dfam_audit is the one
+serializer; both CLI `--json` and `AuditResult.to_dict()`/`.to_json()`
+use it -> identical shape. Keys: part, status, printable, exit_code,
+profile, thresholds, bed_contact_mm2, health, counts{fail,judge,
+tolerable}, feature_count, features[{class,severity,z,layers,centroid,
+ledge_mm/cumulative_reach_mm/roof_width_mm,repairs}], exclusions,
+auto_zones[{zlo,zhi,rmax,center,step_deg,lobes}]. `--json` prints ONE
+object and suppresses human text (say() shim); exit codes unchanged
+(FAIL=1 else 0), so `stalagmite p.stl --auto-ex --json` gates cleanly.
+audit() gained as_json param; AuditResult stores auto_zones + thresholds.
+64 pytest (added 2). This is the stable machine contract.
+
+## Status 2026-07-19 (v0.13.0) — Python API + CadQuery + classifier fix
+
+- **`import stalagmite` public API** (stalagmite.py facade module):
+  `check(obj, ...)` -> `AuditResult` (status, printable, failed,
+  exit_code, count(), defects(), write_report()). `to_mesh(obj)` coerces
+  a CadQuery Workplane/Shape, an STL/OBJ/PLY/3MF path, a trimesh, a
+  trimesh Scene, or a (verts, faces) pair. Also re-exports profile(),
+  diff_audits, solve_orientation, write_report.
+- **CadQuery integration**: `_cq_to_mesh()` tessellates a Workplane/Shape
+  in memory (fallback: cq STL export) -- audits a CadQuery part with no
+  file round-trip. Optional extra `pip install stalagmite[cadquery]`.
+  Worked demo `examples/cadquery_demo.py`: parametric boss, audit-driven
+  taper sweep finds the 45-deg minimum (10mm), writes reports, exits 0/1
+  for CI. Verified end-to-end (cadquery 2.8 installed in dev).
+- **Classifier fix found via the CadQuery test**: a steep cone that grows
+  ~1.6mm/layer (a ~79deg overhang) was mis-rated "tolerable" because each
+  per-layer ledge was under the 1.8mm allowance. The allowance is for an
+  ISOLATED ledge; a sustained slope stacks. aggregate() now sums per-
+  layer cantilever reaches into `cum_reach`; a steep-growth feature with
+  cum_reach > LEDGE_MAX escalates tolerable->fail. Baseline 9/5/4/4/4/3
+  and all severity tests unchanged (per-violation severity untouched;
+  only feature-level). 62 pytest (added 6).
+
+## Status 2026-07-19 (v0.12.1) — REVERTED the 3D fix ghost (was wrong)
+
+v0.12.0 tried a translucent green 3D ghost of the fix (cone/pillar).
+REMOVED in 0.12.1: it modelled every fix as a circular CONE primitive
+centred on the feature centroid with a bbox radius -> for a rectangular
+enclosure with a small edge overhang it drew a giant green disc floating
+mid-part, obscuring the real defect. User (correctly): "way off, does
+more harm than good." Lesson: a circular primitive is only honest for
+axisymmetric features; a correct 3D fix ghost needs a real swept-
+envelope solid lofted from the actual support polygon (deferred - hard,
+maybe later). Instead the accurate 2D transition diagram (already exact
+for ANY cross-section, incl. rectangles) now carries a one-line fix
+caption on fail features: "morph the red back within the dashed
+envelope, or ground to solid below." _fix_preview()/showFix()/fixtog
+all removed. 56 pytest (dropped the 2 fix tests).
+
+Kept from this session: v0.11.1 UX -- Audit tab shows the report inline
+full-screen immediately (iframe #viewer + slim bar New audit/Download/
+Open), no separate "open" click (user feedback).
+
+## Status 2026-07-19 (v0.11.0) — full GUI (audit + orient + compare)
+
+The browser app is now the whole toolkit, no CLI needed. `dfam_gui.py`
+rewritten with three tabs and testable endpoint helpers:
+- run_audit_html(bytes,...) -> report HTML (Audit tab; Open + Download).
+- run_orient(bytes, axis) -> JSON {theta_x, theta_y, before, after,
+  reduction%, oriented STL base64}. Orient tab shows support-% cut +
+  "Download oriented STL"; optional keep-axis-vertical for threads.
+- run_diff(old_bytes, new_bytes,...) -> JSON verdict + resolved/persist/
+  introduced (serializable via dfam_diff._label). Compare tab renders a
+  coloured diff list + status badges.
+POST routes: /audit (raw->HTML), /orient (raw->JSON+b64 STL),
+/diff (JSON{old,new b64}->JSON). All localhost, 300MB cap. Verified
+end-to-end with Playwright (drove the Compare flow: 05->06 IMPROVED).
+56 pytest cases (added 4 GUI-endpoint tests). T-shape orient demo:
+-100% support (rotates flat).
+
+## Status 2026-07-19 (v0.10.0) — kernel robustness + browser GUI
+
+- **Robustness (Terra #7).** `load_mesh(path)` concatenates scenes,
+  rejects empty/non-mesh, and `sanitize_mesh()` drops infinite/NaN
+  coords + degenerate/duplicate faces + merges vertices (all guarded for
+  trimesh API drift). `mesh_health(mesh)` returns notes (non-watertight,
+  winding, near-zero height, suspicious units) shown in CLI and report.
+  `slice_region()` fully wrapped -> None on any bad section instead of
+  crashing. audit()/diff/gui all use load_mesh. Baseline untouched
+  (tests still load fixtures via trimesh.load + audit_mesh directly).
+- **Browser GUI (`stalagmite-gui`).** `dfam_gui.py`: stdlib
+  ThreadingHTTPServer on 127.0.0.1:8757, branded drop-an-STL landing
+  page (profile dropdown, auto-ex + suggest checkboxes), POST /audit
+  receives raw bytes -> runs the real tested pipeline -> returns the
+  report HTML, which the page opens as a blob URL. Localhost only,
+  nothing uploaded. `dfam_report.render_report()` factored out (returns
+  HTML string) so the GUI reuses the exact report code. 300MB cap,
+  graceful error page.
+- 52 pytest cases. Answers "is it CLI-only?" -> no longer.
+
+## Status 2026-07-19 (v0.9.0) — diff mode (the v2->v7 loop as a command)
+
+My addition beyond Terra's list (they missed it). `dfam_diff.py` +
+`stalagmite-diff old.stl new.stl`: audits both revisions under one
+profile, matches defect features by class-group + plan position + z
+overlap (same coordinate frame assumed), and reports each as RESOLVED /
+PERSISTS (with severity delta) / NEW / NEW-FAIL. Verdict IMPROVED /
+REGRESSED / CHANGED / UNCHANGED; exit 1 only on regression (introduced
+or worsened a fail) -> CI-gateable. Validated on the real history:
+05->06 = micro-ring RESOLVED, bridge PERSISTS, IMPROVED; 03->01 =
+boss NEW-FAIL, REGRESSED/exit1. `diff_audits()` public API. 49 pytest.
+
+## Status 2026-07-19 (v0.8.1) — transition-explainer overlay
+
+Terra review point #9, shipped. Selecting a defect in the HTML report
+now draws a 2D cross-section (SVG) beside the 3D view: support slice
+below (gray fill), the 45-deg allowed envelope grown from it (blue
+dashed), this slice (light outline), and material past the envelope
+(red fill). Turns "red facets" into "here's why, and here's the allowed
+shape." Refactored `slice_region(mesh, z)` out of `slices()` (single-z
+sectioning, reused by the report). `dfam_report._transition_diagram()`
++ `_rings()` build the payload; JS `drawSlice()` renders it in the
+`#slice` panel. 45 pytest cases. The flange fixture's diagram is the
+poster child: giant red hex on a tiny dashed-circle envelope = wide
+feature on a narrow neck.
+
+## Status 2026-07-19 (v0.8.0) — truthful states + profiles
+
+Acting on external review (ChatGPT "Terra 5.6"): its two highest-value,
+lowest-risk points, both shipped.
+
+- **Truthful result states.** `overall_status()` -> PASS /
+  PASS_WITH_LIMITS / REVIEW / FAIL from aggregated feature severities +
+  lint. Fixes a real inconsistency: fixture 06 ("clean, one intentional
+  bridge") used to exit 1 like an unprintable boss; now REVIEW/exit 0.
+  Only FAIL is nonzero (CI-safe). Status shown in CLI final line and as
+  a coloured banner in the HTML report. `audit()` now RETURNS the status
+  string (was bool); `main()` maps via STATUS_EXIT.
+- **Process profiles (`dfam_profiles.py`).** Named threshold bundles
+  with per-value provenance. Built-ins: `generic-fdm` (conservative
+  default) + `generic-fdm-fine` (0.2mm). `--profile NAME`,
+  `--profile-file JSON`, `--list-profiles`; flags override; `--no-lint`
+  to silence surface/wall notes. JSON accepts *_mm/*_deg aliases. Sample
+  in docs/profiles/example_bambu_petg.json. Default profile now activates
+  min_wall+warn_angle lint by default (was opt-in) -> clean parts with a
+  chamfer read PASS_WITH_LIMITS. audit_mesh() signature UNCHANGED so the
+  9/5/4/4/4/3 baseline is untouched (profiles only affect the CLI path).
+- 43 pytest cases. Not yet done from Terra's list: regression corpus (a
+  data discipline), design-intent tags/sidecar (the anonymous-mesh-face
+  UX problem), transition-explainer overlay in report (#9, good next),
+  parametric-source repair (#6, hard - deferred), a diff mode (my add).
+
 ## Status 2026-07-18 (v0.7.0) — interactive HTML 3D report
 
 - `--report out.html` (dfam_report.py): one self-contained file — panel

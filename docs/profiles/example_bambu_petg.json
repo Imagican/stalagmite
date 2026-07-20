@@ -1,0 +1,18 @@
+{
+  "name": "bambu-x1c-petg-0.4n-0.2l",
+  "description": "Example: Bambu X1C, PETG, 0.4mm nozzle, 0.2mm layers (illustrative values - calibrate your own).",
+  "nozzle_mm": 0.4,
+  "material": "PETG",
+  "layer_height_mm": 0.2,
+  "thresholds": {
+    "angle_deg": 50,
+    "ledge_max_mm": 1.2,
+    "bridge_max_mm": 8.0,
+    "min_wall_mm": 0.9,
+    "warn_angle_deg": 35
+  },
+  "provenance": {
+    "angle_deg": "user coupon test 2026-07",
+    "bridge_max_mm": "user bridging calibration print"
+  }
+}

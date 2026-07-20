@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stalagmite"
-version = "0.7.0"
+version = "0.14.0"
 description = "Make stalagmites, not stalactites: mechanical enforcement of FDM print physics on STL geometry, with classified violations, prescriptive repairs, and constraint-aware orientation."
 readme = "README.md"
 license = { text = "MIT" }
@@ -20,15 +20,23 @@ classifiers = [
 ]
 dependencies = ["numpy", "trimesh", "shapely>=2.0", "networkx", "scipy"]
 
+[project.urls]
+Homepage = "https://github.com/Imagican/stalagmite"
+Repository = "https://github.com/Imagican/stalagmite"
+Issues = "https://github.com/Imagican/stalagmite/issues"
+
 [project.optional-dependencies]
 dev = ["pytest"]
+cadquery = ["cadquery"]
 
 [project.scripts]
 stalagmite = "dfam_audit:main"
 stalagmite-orient = "dfam_orient:main"
+stalagmite-diff = "dfam_diff:main"
+stalagmite-gui = "dfam_gui:main"
 # legacy aliases
 dfam-audit = "dfam_audit:main"
 dfam-orient = "dfam_orient:main"
 
 [tool.setuptools]
-py-modules = ["dfam_audit", "dfam_orient", "dfam_report", "vendor_three"]
+py-modules = ["stalagmite", "dfam_audit", "dfam_orient", "dfam_report", "dfam_profiles", "dfam_diff", "dfam_gui", "vendor_three"]

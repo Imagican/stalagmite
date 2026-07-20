@@ -15,6 +15,7 @@ Path3D.to_2D(), whose arbitrary per-slice rotation frames hallucinate
 violations on rotationally-asymmetric features).
 """
 import sys
+import json
 import numpy as np
 import trimesh
 from dataclasses import dataclass
@@ -40,6 +41,36 @@ CONTACT_EPS = 0.15    # mm  - tolerance for "touches" tests in classification
 # severity: "fail" | "judge" (printable but human decides) | "tolerable"
 # lint-only: "surface" (prints, degraded quality -- never fails the audit)
 SEVERITY_ORDER = {"fail": 0, "judge": 1, "tolerable": 2, "surface": 3}
+
+# Truthful result states -- a deliberate bridge must not read like an
+# unprintable floating boss. Only FAIL is a nonzero exit; the rest print.
+#   PASS             nothing to note
+#   PASS_WITH_LIMITS prints as-is; only within-allowance ledges / surface
+#                    notes (deliberate short ledges, rough downskin)
+#   REVIEW           printable, but contains bridge(s) to eyeball first
+#   FAIL             will not print as oriented; needs a fix or reorient
+STATUS_EXIT = {"PASS": 0, "PASS_WITH_LIMITS": 0, "REVIEW": 0, "FAIL": 1}
+STATUS_BLURB = {
+    "PASS": "every layer supported; no concerns.",
+    "PASS_WITH_LIMITS": "prints as-is -- only within-allowance ledges or "
+                        "surface-quality notes.",
+    "REVIEW": "printable, but contains judged bridge(s) -- eyeball before "
+              "printing.",
+    "FAIL": "will NOT print as oriented -- needs a design fix or reorient.",
+}
+
+
+def overall_status(features, warnings=None):
+    """Derive the four-state result from aggregated defect features
+    (and any lint warnings). See STATUS_BLURB for meanings."""
+    sevs = {f["severity"] for f in features}
+    if "fail" in sevs:
+        return "FAIL"
+    if "judge" in sevs:
+        return "REVIEW"
+    if "tolerable" in sevs or (warnings and len(warnings) > 0):
+        return "PASS_WITH_LIMITS"
+    return "PASS"
 
 
 @dataclass
@@ -72,23 +103,85 @@ class Violation:
         return base
 
 
-def slices(mesh, dz):
-    z0, z1 = mesh.bounds[0][2], mesh.bounds[1][2]
-    zs = np.arange(z0 + dz * 0.51, z1 - dz * 0.11, dz)
-    for z in zs:
+def sanitize_mesh(mesh):
+    """Best-effort clean-up so noisy / real-world STLs don't crash the
+    slicer: drop infinite/NaN coords, merge coincident vertices, remove
+    degenerate and duplicate faces, drop unreferenced vertices. Every
+    step is guarded (trimesh APIs vary by version) and non-fatal."""
+    m = mesh.copy()
+    ops = [
+        lambda: m.remove_infinite_values(),
+        lambda: m.merge_vertices(),
+        lambda: m.update_faces(m.nondegenerate_faces()),
+        lambda: m.update_faces(m.unique_faces()),
+        lambda: m.remove_unreferenced_vertices(),
+    ]
+    for op in ops:
+        try:
+            op()
+        except Exception:
+            pass
+    return m
+
+
+def load_mesh(path):
+    """Load any trimesh-supported file into a single sanitized Trimesh.
+    Concatenates scenes; raises ValueError on empty / non-mesh input."""
+    m = trimesh.load(path, force="mesh")
+    if isinstance(m, trimesh.Scene):
+        if not m.geometry:
+            raise ValueError(f"no geometry found in {path}")
+        m = trimesh.util.concatenate(tuple(m.geometry.values()))
+    if not isinstance(m, trimesh.Trimesh) or len(m.faces) == 0:
+        raise ValueError(f"could not load a triangle mesh from {path}")
+    return sanitize_mesh(m)
+
+
+def mesh_health(mesh):
+    """Return human-readable health notes (empty = clean). These do not
+    fail the audit; they caveat how much to trust it."""
+    notes = []
+    try:
+        if not mesh.is_watertight:
+            notes.append("not watertight (open edges) -- results may be "
+                         "approximate near boundaries")
+        if not mesh.is_winding_consistent:
+            notes.append("inconsistent face winding -- normals unreliable")
+    except Exception:
+        pass
+    ext = mesh.bounds[1] - mesh.bounds[0]
+    if float(ext[2]) < 1e-6:
+        notes.append("near-zero build height -- nothing to slice")
+    mx = float(ext.max())
+    if 0 < mx < 3:
+        notes.append(f"very small (max dim {mx:.2f}mm) -- check units "
+                     f"(stalagmite assumes millimetres)")
+    elif mx > 2000:
+        notes.append(f"very large (max dim {mx:.0f}mm) -- check units "
+                     f"(stalagmite assumes millimetres)")
+    return notes
+
+
+def slice_region(mesh, z):
+    """World-space cross-section region at height z (no 2D frame, so
+    cross-slice comparison never hallucinates on asymmetric parts).
+    Returns a shapely (Multi)Polygon or None. Fully guarded so a bad
+    section on a noisy mesh yields None rather than crashing the run."""
+    try:
         sec = mesh.section(plane_origin=[0, 0, z], plane_normal=[0, 0, 1])
         if sec is None:
-            yield z, None
-            continue
-        # build region directly from world-space section loops (no 2D frame)
+            return None
         loops = [np.asarray(d)[:, :2] for d in sec.discrete if len(d) >= 3]
         polys = []
         for l in loops:
-            p = Polygon(l)
-            if not p.is_valid:
-                p = p.buffer(0)
-            if not p.is_empty:
-                polys.append(p)
+            try:
+                p = Polygon(l)
+                if not p.is_valid:
+                    p = p.buffer(0)
+                if not p.is_empty and p.area > 1e-9:
+                    polys.append(p)
+            except Exception:
+                continue
         polys.sort(key=lambda p: p.area, reverse=True)
         region = None
         for p in polys:
@@ -98,7 +191,16 @@ def slices(mesh, dz):
                 region = region.difference(p)
             else:
                 region = region.union(p)
-        yield z, region
+        return region
+    except Exception:
+        return None
+
+
+def slices(mesh, dz):
+    z0, z1 = mesh.bounds[0][2], mesh.bounds[1][2]
+    zs = np.arange(z0 + dz * 0.51, z1 - dz * 0.11, dz)
+    for z in zs:
+        yield z, slice_region(mesh, z)
 
 
 def _ex_parts(e):
@@ -452,6 +554,18 @@ def aggregate(violations, dz=0.4):
                     break
             if merged:
                 break
+    # feature-level steep-growth: the 1.8mm ledge allowance is for an
+    # ISOLATED unsupported ledge, not a sustained slope. A cone that
+    # grows ~1.6mm every layer looks tolerable layer-by-layer but stacks
+    # into a steep unprintable wall. Sum the per-layer cantilever reaches
+    # (cumulative horizontal distance out over unsupported material); if
+    # that exceeds the ledge allowance, it is a real overhang -> fail.
+    for f in features:
+        if f["cls"] == "steep-growth":
+            cum = sum((v.ledge or 0.0) for v in f["layers"])
+            f["cum_reach"] = cum
+            if cum > LEDGE_MAX and f["severity"] == "tolerable":
+                f["severity"] = "fail"
     # feature-level bridge span: the minor axis of the merged region's
     # minimum rotated rectangle ~ the physical width being roofed
     # (per-layer free spans only measure the corbelling step)
@@ -472,52 +586,135 @@ def aggregate(violations, dz=0.4):
     return features
 
 
-def audit(path, max_angle=45.0, dz=0.4, exclude=(), export=None,
-          suggest=False, warn_angle=None, min_wall=None, auto_ex=False,
-          report=None):
-    """CLI-style audit: load, run, print report. Returns True on PASS."""
-    m = trimesh.load(path, force='mesh')
+def result_dict(part, status, features, bed_area, profile_name,
+                thresholds, health, exclude, auto_zones=None):
+    """JSON-serialisable summary of an audit -- the shape returned by
+    `--json` and by stalagmite.AuditResult.to_dict(). This is the stable
+    machine interface: gate/log against these keys."""
+    def feat(f):
+        d = {"class": f["cls"], "severity": f["severity"],
+             "z": [round(f["zlo"], 2), round(f["zhi"], 2)],
+             "layers": len(f["layers"])}
+        g = f.get("geom")
+        if g is not None and not getattr(g, "is_empty", True):
+            d["centroid"] = [round(g.centroid.x, 2), round(g.centroid.y, 2)]
+        if f["cls"] == "steep-growth":
+            d["ledge_mm"] = round(max((v.ledge or 0.0)
+                                      for v in f["layers"]), 2)
+            if f.get("cum_reach") is not None:
+                d["cumulative_reach_mm"] = round(f["cum_reach"], 2)
+        if f["cls"] == "bridge" and f.get("roof_width"):
+            d["roof_width_mm"] = round(f["roof_width"], 2)
+        if f.get("repairs"):
+            d["repairs"] = f["repairs"]
+        return d
+    return {
+        "part": part,
+        "status": status,
+        "printable": status != "FAIL",
+        "exit_code": STATUS_EXIT.get(status, 1),
+        "profile": profile_name,
+        "thresholds": thresholds,
+        "bed_contact_mm2": round(bed_area or 0.0, 1),
+        "health": list(health or []),
+        "counts": {s: sum(1 for f in features if f["severity"] == s)
+                   for s in ("fail", "judge", "tolerable")},
+        "feature_count": len(features),
+        "features": [feat(f) for f in features],
+        "exclusions": [list(_ex_parts(e)) for e in exclude],
+        "auto_zones": [
+            {"zlo": round(z["zlo"], 2), "zhi": round(z["zhi"], 2),
+             "rmax": round(z["rmax"], 2),
+             "center": [round(z["cx"], 2), round(z["cy"], 2)],
+             "step_deg": round(z.get("step_deg", 0.0), 1),
+             "lobes": z.get("n")}
+            for z in (auto_zones or [])],
+    }
+
+
+def audit(path, exclude=(), export=None, suggest=False, auto_ex=False,
+          report=None, profile=None, lint=True, as_json=False):
+    """CLI-style audit: load, run, print report. Returns the four-state
+    status string (see overall_status / STATUS_BLURB).
+
+    `profile` is a dfam_profiles.ResolvedProfile (thresholds + metadata).
+    If None, a conservative generic-fdm profile is resolved. `lint`
+    activates the profile's min_wall / warn_angle surface checks.
+    `as_json` prints ONE JSON object (result_dict) and suppresses the
+    human report -- for scripting / CI. Exit-code semantics are unchanged.
+    """
+    if profile is None:
+        import dfam_profiles
+        profile = dfam_profiles.resolve()
+    max_angle, dz = profile.angle, profile.dz
+    ledge_max, bridge_max = profile.ledge_max, profile.bridge_max
+    warn_angle = profile.warn_angle if lint else None
+    min_wall = profile.min_wall if lint else None
+    say = (lambda *a, **k: None) if as_json else print
+
+    m = load_mesh(path)
     exclude = list(exclude)
-    print(f"== DfAM audit: {path}  (rule: {max_angle} deg, layer {dz}mm) ==")
+    health = mesh_health(m)
+    say(f"== stalagmite audit: {path} ==")
+    say(f"   {profile.summary_line()}")
+    for note in health:
+        say(f"   mesh health: {note}")
+    auto_zones = []
     if auto_ex:
-        _, pass1 = audit_mesh(m, max_angle, dz, exclude)
-        zones = detect_helix_zones(pass1, dz)
-        for zn in zones:
-            print(f"auto-ex: helix detected z {zn['zlo']:.1f}-"
-                  f"{zn['zhi']:.1f}, r<={zn['rmax']:.1f} around "
-                  f"({zn['cx']:.1f},{zn['cy']:.1f}), "
-                  f"{zn['step_deg']:+.1f} deg/layer ({zn['n']} lobes) "
-                  f"-- reusable as --ex "
-                  f"{zn['zlo']:.1f}:{zn['zhi']:.1f}:{zn['rmax']:.1f}")
+        _, pass1 = audit_mesh(m, max_angle, dz, exclude,
+                              ledge_max, bridge_max)
+        auto_zones = detect_helix_zones(pass1, dz)
+        for zn in auto_zones:
+            say(f"auto-ex: helix detected z {zn['zlo']:.1f}-"
+                f"{zn['zhi']:.1f}, r<={zn['rmax']:.1f} around "
+                f"({zn['cx']:.1f},{zn['cy']:.1f}), "
+                f"{zn['step_deg']:+.1f} deg/layer ({zn['n']} lobes) "
+                f"-- reusable as --ex "
+                f"{zn['zlo']:.1f}:{zn['zhi']:.1f}:{zn['rmax']:.1f}")
             exclude.append((zn["zlo"], zn["zhi"], zn["rmax"],
                             zn["cx"], zn["cy"]))
-        if not zones:
-            print("auto-ex: no thread helices detected")
+        if not auto_zones:
+            say("auto-ex: no thread helices detected")
     warnings = [] if (warn_angle or min_wall) else None
     first_area, violations = audit_mesh(m, max_angle, dz, exclude,
+                                        ledge_max, bridge_max,
                                         warn_angle=warn_angle,
                                         min_wall=min_wall,
                                         warnings_out=warnings)
-    print(f"bed contact: {first_area:.0f} mm2")
+    feats = aggregate(violations, dz)
+    if suggest or report or as_json:
+        suggest_repairs(m, feats, dz, max_angle)
+    status = overall_status(feats, warnings)
+
     if export:
         n = export_colored(m, violations, dz, export)
-        print(f"violation mesh written: {export} ({n} faces painted)")
+        say(f"violation mesh written: {export} ({n} faces painted)")
     if report:
         from dfam_report import write_report
-        rfeats = aggregate(violations, dz)
-        suggest_repairs(m, rfeats, dz, max_angle)
-        write_report(m, violations, rfeats, report,
+        write_report(m, violations, feats, report,
                      meta={"part": path.split("/")[-1].split("\\")[-1],
                            "angle": max_angle, "dz": dz,
-                           "bed": first_area,
+                           "bed": first_area, "status": status,
+                           "profile": profile.name, "health": health,
                            "zones": [list(_ex_parts(e)) for e in exclude]})
-        print(f"interactive report written: {report}")
+        say(f"interactive report written: {report}")
+
+    if as_json:
+        thresholds = {"angle": max_angle, "dz": dz, "ledge_max": ledge_max,
+                      "bridge_max": bridge_max, "min_wall": min_wall,
+                      "warn_angle": warn_angle}
+        print(json.dumps(result_dict(
+            path.split("/")[-1].split("\\")[-1], status, feats, first_area,
+            profile.name, thresholds, health, exclude, auto_zones)))
+        return status
+
+    say(f"bed contact: {first_area:.0f} mm2")
     if warnings:
         wf = aggregate(warnings, dz)
-        print(f"{len(wf)} lint warning(s) (do not fail the audit):")
+        print(f"{len(wf)} lint note(s) (quality, not printability):")
         for f in wf[:8]:
             v0 = max(f["layers"], key=lambda v: v.area)
-            label = ("surface <" + f"{warn_angle:.0f} deg"
+            label = (f"surface <{warn_angle:.0f}deg"
                      if f["cls"] == "steep-surface"
                      else f"wall <{min_wall}mm")
             print(f"  [{label}] z {f['zlo']:.1f}-{f['zhi']:.1f} "
@@ -525,46 +722,35 @@ def audit(path, max_angle=45.0, dz=0.4, exclude=(), export=None,
                   f"({len(f['layers'])} layer(s))")
         if len(wf) > 8:
             print(f"  ... +{len(wf) - 8} more")
-    if not violations:
-        print("PASS - every layer supported within the angle rule.")
-        return True
-    print(f"{len(violations)} violation(s):")
-    for v in violations[:12]:
-        print(f"  z={v.z:6.1f}  {v.area:7.1f} mm2  {v.note}")
-    if len(violations) > 12:
-        print(f"  ... +{len(violations)-12} more")
-    feats = aggregate(violations, dz)
-    if suggest:
-        suggest_repairs(m, feats, dz, max_angle)
-    print(f"-- {len(feats)} defect feature(s) --")
-    for f in feats:
-        v0 = max(f["layers"], key=lambda v: v.area)
-        dims = ""
-        if f["cls"] == "steep-growth":
-            led = max((v.ledge or 0) for v in f["layers"])
-            dims = f", ledge {led:.1f}mm"
-        elif f["cls"] == "bridge":
-            if f.get("roof_width"):
-                dims = f", roofed width ~{f['roof_width']:.1f}mm"
-            else:
-                fre = max((v.free_span or 0) for v in f["layers"])
-                dims = f", free span {fre:.1f}mm"
-        print(f"  [{f['severity']:9s}] {f['cls']:13s} "
-              f"z {f['zlo']:.1f}-{f['zhi']:.1f} "
-              f"({len(f['layers'])} layer(s)"
-              f", @({v0.centroid[0]:.0f},{v0.centroid[1]:.0f}){dims})")
-        for r in f.get("repairs", []):
-            print(f"      -> {r}")
-    print("severity: fail = will not print | judge = printable bridge,")
-    print("rough downskin, human decides | tolerable = ledge within the")
-    print(f"{LEDGE_MAX}mm allowance (Adam & Zimmer 2014).")
-    if suggest:
+    if violations:
+        print(f"{len(violations)} violation(s) across {len(feats)} "
+              f"defect feature(s):")
+        for f in feats:
+            v0 = max(f["layers"], key=lambda v: v.area)
+            dims = ""
+            if f["cls"] == "steep-growth":
+                led = max((v.ledge or 0) for v in f["layers"])
+                dims = f", ledge {led:.1f}mm"
+            elif f["cls"] == "bridge":
+                if f.get("roof_width"):
+                    dims = f", roofed width ~{f['roof_width']:.1f}mm"
+                else:
+                    fre = max((v.free_span or 0) for v in f["layers"])
+                    dims = f", free span {fre:.1f}mm"
+            print(f"  [{f['severity']:9s}] {f['cls']:13s} "
+                  f"z {f['zlo']:.1f}-{f['zhi']:.1f} "
+                  f"({len(f['layers'])} layer(s)"
+                  f", @({v0.centroid[0]:.0f},{v0.centroid[1]:.0f}){dims})")
+            for r in f.get("repairs", []):
+                print(f"      -> {r}")
+    print(f"STATUS: {status} -- {STATUS_BLURB[status]}")
+    if suggest and violations:
         print("re-audit after applying any repair: fixes can create new "
               "overhangs (Adam & Zimmer 2014).")
         print(f"tip: critical z-heights print most accurately at integer "
               f"multiples of the layer height ({dz}mm) -- snap them "
               f"(Lieneke et al. 2016).")
-    return False
+    return status
 
 
 def export_colored(mesh, violations, dz, out_path, halo=0.4):
@@ -714,9 +900,24 @@ def main(argv=None):
         pass                                            # Windows / non-main thread
     ap = argparse.ArgumentParser(
         description="Mechanical enforcement of the 45-degree rule on STL geometry.")
-    ap.add_argument("stl")
-    ap.add_argument("--angle", type=float, default=45.0)
-    ap.add_argument("--dz", type=float, default=0.4)
+    ap.add_argument("stl", nargs="?")
+    ap.add_argument("--profile", default=None, metavar="NAME",
+                    help="named process profile (default: generic-fdm; "
+                         "'--list-profiles' to see all)")
+    ap.add_argument("--profile-file", default=None, metavar="FILE.json",
+                    help="load a custom printer/material profile from JSON")
+    ap.add_argument("--list-profiles", action="store_true",
+                    help="list built-in profiles and exit")
+    ap.add_argument("--angle", type=float, default=None,
+                    help="override profile: max self-support angle (deg)")
+    ap.add_argument("--dz", type=float, default=None,
+                    help="override profile: layer height (mm)")
+    ap.add_argument("--ledge-max", type=float, default=None,
+                    help="override profile: max unsupported ledge (mm)")
+    ap.add_argument("--bridge-max", type=float, default=None,
+                    help="override profile: max bridge span (mm)")
+    ap.add_argument("--no-lint", action="store_true",
+                    help="skip the profile's surface / thin-wall notes")
     ap.add_argument("--ex", action="append", default=[],
                     help="zlo:zhi:rmax[:cx:cy] thread/helix exclusion "
                          "cylinder")
@@ -737,12 +938,31 @@ def main(argv=None):
     ap.add_argument("--min-wall", type=float, default=None, metavar="MM",
                     help="also lint in-plane features thinner than this "
                          "(e.g. 0.8)")
+    ap.add_argument("--json", action="store_true",
+                    help="emit one machine-readable JSON object instead of "
+                         "the human report (exit code unchanged)")
     a = ap.parse_args(argv)
+    import dfam_profiles
+    if a.list_profiles:
+        for key in dfam_profiles.list_profiles():
+            p = dfam_profiles.BUILTIN[key]
+            print(f"{key:20s} {p['description']}")
+        return 0
+    if not a.stl:
+        ap.error("the following arguments are required: stl")
+    try:
+        profile = dfam_profiles.resolve(
+            a.profile, a.profile_file,
+            angle=a.angle, dz=a.dz,
+            ledge_max=a.ledge_max, bridge_max=a.bridge_max,
+            warn_angle=a.warn_angle, min_wall=a.min_wall)
+    except (KeyError, OSError, ValueError) as e:
+        ap.error(str(e))
     ex = [tuple(map(float, e.split(":"))) for e in a.ex]
-    ok = audit(a.stl, a.angle, a.dz, ex, export=a.export,
-               suggest=a.suggest, warn_angle=a.warn_angle,
-               min_wall=a.min_wall, auto_ex=a.auto_ex, report=a.report)
-    return 0 if ok else 1
+    status = audit(a.stl, ex, export=a.export, suggest=a.suggest,
+                   auto_ex=a.auto_ex, report=a.report,
+                   profile=profile, lint=not a.no_lint, as_json=a.json)
+    return STATUS_EXIT.get(status, 1)
 
 
 if __name__ == "__main__":

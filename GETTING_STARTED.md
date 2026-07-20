@@ -17,7 +17,15 @@ no prior command-line experience assumed.
    That pulls in everything it needs and gives you two commands:
    `stalagmite` and `stalagmite-orient`.
 
-## Everyday use
+## No command line? Use the app
+
+    stalagmite-gui
+
+This opens a page in your browser. Drag an STL onto it, pick a profile,
+click Run audit, and the interactive 3D report appears. Everything runs
+on your own computer — nothing is uploaded. This is the easiest way in.
+
+## Everyday use (command line)
 
 Audit any STL — thread detection is automatic:
 
