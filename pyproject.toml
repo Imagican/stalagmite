@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stalagmite"
-version = "0.14.0"
+version = "0.34.0"
 description = "Make stalagmites, not stalactites: mechanical enforcement of FDM print physics on STL geometry, with classified violations, prescriptive repairs, and constraint-aware orientation."
 readme = "README.md"
 license = { text = "MIT" }
@@ -18,7 +18,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering",
 ]
-dependencies = ["numpy", "trimesh", "shapely>=2.0", "networkx", "scipy"]
+dependencies = ["numpy", "trimesh", "shapely>=2.0", "networkx", "scipy", "manifold3d"]
 
 [project.urls]
 Homepage = "https://github.com/Imagican/stalagmite"
@@ -34,9 +34,12 @@ stalagmite = "dfam_audit:main"
 stalagmite-orient = "dfam_orient:main"
 stalagmite-diff = "dfam_diff:main"
 stalagmite-gui = "dfam_gui:main"
+stalagmite-fix = "dfam_fix:main"
+stalagmite-autofix = "dfam_autofix:main"
+stalagmite-batch = "dfam_batch:main"
 # legacy aliases
 dfam-audit = "dfam_audit:main"
 dfam-orient = "dfam_orient:main"
 
 [tool.setuptools]
-py-modules = ["stalagmite", "dfam_audit", "dfam_orient", "dfam_report", "dfam_profiles", "dfam_diff", "dfam_gui", "vendor_three"]
+py-modules = ["stalagmite", "dfam_audit", "dfam_orient", "dfam_report", "dfam_profiles", "dfam_diff", "dfam_gui", "dfam_repair", "dfam_fix", "dfam_autofix", "dfam_intent", "dfam_logo", "dfam_batch", "vendor_three"]

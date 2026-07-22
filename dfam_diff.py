@@ -48,9 +48,11 @@ def _z_overlap(a, b, tol=1.2):
     return not (a["zhi"] < b["zlo"] - tol or b["zhi"] < a["zlo"] - tol)
 
 
-def _match(old_feats, new_feats):
+def match_features(old_feats, new_feats):
     """Greedy nearest match by class-group, plan position and z overlap.
-    Returns (resolved_idx, persist_pairs, introduced_idx)."""
+    Returns (resolved_idx, persist_pairs, introduced_idx). Public: shared
+    by revision diffing (stalagmite-diff) and fix verification
+    (stalagmite-fix)."""
     free = list(range(len(new_feats)))
     persist, resolved = [], []
     for i, of in enumerate(old_feats):
@@ -113,7 +115,7 @@ def diff_audits(old_path, new_path, profile=None, exclude=(), auto_ex=False):
         profile = dfam_profiles.resolve()
     old_f, old_status = _audit_one(old_path, profile, exclude, auto_ex)
     new_f, new_status = _audit_one(new_path, profile, exclude, auto_ex)
-    resolved, persist, introduced = _match(old_f, new_f)
+    resolved, persist, introduced = match_features(old_f, new_f)
 
     worsened, improved_sev = [], []
     for oi, nj in persist:

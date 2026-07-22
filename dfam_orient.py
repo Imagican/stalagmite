@@ -151,6 +151,71 @@ def support_proxy(mesh, R, max_angle=45.0, dz=0.4, ex_mask=None,
     return float((lengths * areas).sum() * scale)
 
 
+# ------------------------------------------- containment-audit verification
+
+def pose_mesh(mesh, R):
+    """A rotated copy of the mesh, dropped to the build plate."""
+    m2 = mesh.copy()
+    m2.apply_transform(
+        np.vstack([np.hstack([R, [[0], [0], [0]]]), [0, 0, 0, 1]]))
+    tz = -float(m2.bounds[0][2])
+    m2.apply_translation([0, 0, tz])
+    return m2, tz
+
+
+def transform_zones(exclude, R, tz):
+    """Map part-frame cylindrical zones into a pose's build frame.
+
+    A zone's axis is vertical in the part frame; it can only be mapped
+    when the pose keeps that axis vertical (upright or flipped).
+    Returns (mapped_zones, dropped_count)."""
+    mapped, dropped = [], 0
+    for e in exclude:
+        if len(e) == 5:
+            zlo, zhi, rmax, cx, cy = e
+        else:
+            (zlo, zhi, rmax), cx, cy = e, 0.0, 0.0
+        p1 = R @ np.array([cx, cy, zlo], dtype=float)
+        p2 = R @ np.array([cx, cy, zhi], dtype=float)
+        if np.hypot(*(p2 - p1)[:2]) > 1e-6 * max(1.0, abs(zhi - zlo)):
+            dropped += 1                      # axis tilted: zone invalid
+            continue
+        lo, hi = sorted((p1[2] + tz, p2[2] + tz))
+        mapped.append((lo, hi, rmax, float(p1[0]), float(p1[1])))
+    return mapped, dropped
+
+
+def verify_pose(mesh, tx, ty, exclude=(), max_angle=45.0, dz=0.4):
+    """Run the FULL containment audit on one pose. Returns a dict of
+    evidence: status, fail/judge counts, and zone-mapping honesty."""
+    from dfam_audit import audit_mesh, aggregate, overall_status
+    R = rotmat(tx, ty)
+    m2, tz = pose_mesh(mesh, R)
+    zones, dropped = transform_zones(exclude, R, tz)
+    _, viol = audit_mesh(m2, max_angle, dz, zones)
+    feats = aggregate(viol, dz)
+    n = {s: sum(1 for f in feats if f["severity"] == s)
+         for s in ("fail", "judge", "tolerable")}
+    return {"theta_x": float(tx), "theta_y": float(ty),
+            "status": overall_status(feats), "fails": n["fail"],
+            "judge": n["judge"], "tolerable": n["tolerable"],
+            "zones_mapped": len(zones), "zones_dropped": dropped}
+
+
+def _top_distinct(X, Y, k, min_sep=20.0):
+    """Indices of the k best-scoring poses at least min_sep degrees
+    apart (wrapped)."""
+    order = np.argsort(Y)
+    picked = []
+    for i in order:
+        if len(picked) >= k:
+            break
+        if all(_wrap_dist(X[i][None], X[j][None])[0, 0] >= min_sep
+               for j in picked):
+            picked.append(int(i))
+    return picked
+
+
 # ---------------------------------------------------- Bayesian optimiser
 
 def _wrap_dist(A, B):
@@ -166,9 +231,15 @@ def _matern52(D, ls):
 
 def solve_orientation(mesh, constraints=(), exclude=(), max_angle=45.0,
                       dz=0.4, iters=35, n_init=8, max_rays=600, seed=0,
-                      verbose=False):
+                      verbose=False, verify_top=0):
     """Search (theta_x, theta_y) minimising support proxy + constraint
-    penalties. Returns dict with pose, scores, and history."""
+    penalties. Returns dict with pose, scores, and history.
+
+    verify_top=K > 0 re-ranks the K best distinct poses by the FULL
+    containment audit (the same physics as `stalagmite`): the winner is
+    the pose with the fewest fail features, then fewest judged bridges,
+    then the proxy score -- the proxy proposes, the audit disposes.
+    The result gains "audit" (winner evidence) and "verified" (all K)."""
     rng = np.random.default_rng(seed)
     ex_mask = exclusion_mask(mesh, exclude) if exclude else None
 
@@ -221,11 +292,34 @@ def solve_orientation(mesh, constraints=(), exclude=(), max_angle=45.0,
                   f"{x_new[1]:6.1f})  proxy {p_new:10.1f}  "
                   f"pen {c_new:6.2f} deg  best {Y.min():10.1f}")
     i = int(np.argmin(Y))
+    verified, audit_ev, chosen_by = [], None, "proxy"
+    if verify_top and verify_top > 0:
+        cand_i = _top_distinct(X, Y, int(verify_top))
+        for j in cand_i:
+            ev = verify_pose(mesh, X[j][0], X[j][1], exclude,
+                             max_angle, dz)
+            ev["proxy"] = float(P[j])
+            ev["score"] = float(Y[j])
+            verified.append((j, ev))
+            if verbose:
+                drop = (f", {ev['zones_dropped']} zone(s) dropped "
+                        f"(axis tilted)" if ev["zones_dropped"] else "")
+                print(f"  verify pose ({X[j][0]:6.1f},{X[j][1]:6.1f}): "
+                      f"{ev['status']}  {ev['fails']} fail, "
+                      f"{ev['judge']} judge{drop}")
+        # audit disposes: fewest fails, then judges, then proxy score
+        verified.sort(key=lambda t: (t[1]["fails"], t[1]["judge"],
+                                     t[1]["score"]))
+        i = verified[0][0]
+        audit_ev = verified[0][1]
+        chosen_by = "containment-audit"
     R = rotmat(*X[i])
     return {"theta_x": float(X[i][0]), "theta_y": float(X[i][1]),
             "R": R, "proxy": float(P[i]), "penalty_deg": float(C[i]),
             "penalties": {c.label: c.penalty_deg(R) for c in constraints},
             "score": float(Y[i]), "weight": w, "evals": len(X),
+            "chosen_by": chosen_by, "audit": audit_ev,
+            "verified": [ev for _, ev in verified],
             "history": np.column_stack([X, P, C])}
 
 
@@ -252,6 +346,10 @@ def main(argv=None):
     ap.add_argument("--dz", type=float, default=0.4)
     ap.add_argument("--iters", type=int, default=35)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--verify-top", type=int, default=3, metavar="K",
+                    help="re-rank the K best poses by the FULL "
+                         "containment audit (0 = proxy only). "
+                         "Default 3.")
     ap.add_argument("--save", metavar="OUT.stl", default=None,
                     help="write the best-pose mesh (dropped to z=0)")
     a = ap.parse_args(argv)
@@ -261,13 +359,23 @@ def main(argv=None):
     print(f"== DfAM orient: {a.stl}  ({len(cons)} constraint(s), "
           f"{a.iters} iterations) ==")
     res = solve_orientation(mesh, cons, ex, a.angle, a.dz,
-                            iters=a.iters, seed=a.seed, verbose=True)
+                            iters=a.iters, seed=a.seed, verbose=True,
+                            verify_top=a.verify_top)
     print(f"best pose: rotate X {res['theta_x']:.1f} deg, "
           f"Y {res['theta_y']:.1f} deg  "
           f"(support proxy {res['proxy']:.0f}, "
           f"constraint penalty {res['penalty_deg']:.2f} deg)")
     for label, p in res["penalties"].items():
         print(f"  {label}: {p:.2f} deg off target")
+    if res.get("audit"):
+        a_ev = res["audit"]
+        print(f"chosen by containment audit: {a_ev['status']} "
+              f"({a_ev['fails']} fail, {a_ev['judge']} judge) "
+              f"at this pose")
+        if a_ev["zones_dropped"]:
+            print(f"  note: {a_ev['zones_dropped']} exclusion zone(s) "
+                  f"could not be mapped (pose tilts their axis) -- "
+                  f"audit ran without them (conservative)")
     if a.save:
         R = res["R"]
         T = np.vstack([np.hstack([R, [[0], [0], [0]]]), [0, 0, 0, 1]])
@@ -278,7 +386,13 @@ def main(argv=None):
         print(f"oriented mesh written: {a.save}")
     print("note: proxy ignores exclusion-zone faces only in the part "
           "frame; keep the excluded axis vertical via --axis-vertical.")
-    print("re-audit the oriented mesh with dfam_audit.py before printing.")
+    if res.get("audit"):
+        print("the chosen pose was verified by the full containment "
+              "audit; a final `stalagmite` run on the saved mesh is "
+              "still good hygiene.")
+    else:
+        print("re-audit the oriented mesh with dfam_audit.py before "
+              "printing.")
     return 0
 
 

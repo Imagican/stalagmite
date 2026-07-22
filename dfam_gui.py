@@ -68,7 +68,7 @@ def run_audit_html(raw, name, profile_name, auto_ex, suggest):
         return render_report(m, viol, feats, meta={
             "part": os.path.basename(name), "angle": profile.angle,
             "dz": profile.dz, "bed": bed, "status": status,
-            "profile": profile.name, "health": mesh_health(m),
+            "profile": profile.name, "health": mesh_health(m, profile.dz),
             "zones": [list(z) for z in exclude]})
     finally:
         try:
@@ -126,6 +126,63 @@ def run_orient(raw, name, profile_name, axis):
             pass
 
 
+def run_fix(raw, name, profile_name, auto_ex, keep=(), sculpt=()):
+    """Bytes -> fix result dict incl. fixed STL (b64) and a full report
+    of the FIXED part, so the GUI can show before -> after seamlessly.
+    `keep` = design-intent keep-clear zones (from the report's protect
+    toggles): no repair may touch them."""
+    import dfam_profiles
+    from dfam_audit import (load_mesh, suggest_repairs, mesh_health,
+                            _ex_parts)
+    from dfam_fix import apply_fixes
+    from dfam_report import render_report
+    profile = dfam_profiles.resolve(profile_name or None)
+    path = _tmp_write(raw, name)
+    try:
+        m = load_mesh(path)
+        r = apply_fixes(m, profile, auto_ex=auto_ex, keep=keep,
+                        sculpt=sculpt)
+        out = r.to_dict()
+        out["ok"] = True
+        out["part"] = os.path.basename(name)
+        stem = os.path.splitext(os.path.basename(name))[0]
+        if r.verdict in ("VERIFIED", "PARTIAL", "NOT_IMPROVED"):
+            stl = r.mesh_fixed.export(file_type="stl")
+            if isinstance(stl, str):
+                stl = stl.encode()
+            out["stl_b64"] = base64.b64encode(stl).decode()
+            # NOT_IMPROVED: the file is available but honestly named --
+            # this is the GUI's equivalent of the CLI's --force
+            out["stl_name"] = (f"{stem}_fixed.stl"
+                               if r.verdict != "NOT_IMPROVED"
+                               else f"{stem}_attempt_FAILS.stl")
+        # ALWAYS show the re-audited outcome -- including a refused
+        # attempt (never-worse withholds the STL, not the evidence)
+        if r.verdict in ("VERIFIED", "PARTIAL", "NOT_IMPROVED"):
+            label = out.get("stl_name") or \
+                f"{stem} — attempted fix (output withheld)"
+            if keep:
+                from dfam_intent import annotate_features
+                annotate_features(r.feats_after, keep)
+            suggest_repairs(r.mesh_fixed, r.feats_after, profile.dz,
+                            profile.angle)
+            out["fixed_report"] = render_report(
+                r.mesh_fixed,
+                [v for f in r.feats_after for v in f["layers"]],
+                r.feats_after,
+                meta={"part": label, "angle": profile.angle,
+                      "dz": profile.dz, "status": r.status_after,
+                      "profile": profile.name,
+                      "health": mesh_health(r.mesh_fixed, profile.dz),
+                      "zones": [list(_ex_parts(e)) for e in r.exclude]})
+        return out
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 def run_diff(old_raw, old_name, new_raw, new_name, profile_name, auto_ex):
     """Two byte blobs -> diff result dict (serializable)."""
     import dfam_profiles
@@ -170,7 +227,9 @@ def _landing():
     import dfam_profiles
     opts = "".join(f'<option value="{html.escape(k)}">{html.escape(k)}'
                    f'</option>' for k in dfam_profiles.list_profiles())
-    return _LANDING.replace("__PROFILE_OPTS__", opts)
+    from dfam_logo import logo_data_uri
+    return _LANDING.replace("__PROFILE_OPTS__", opts) \
+                   .replace("__LOGO__", logo_data_uri())
 
 
 def _err_json(msg):
@@ -232,6 +291,17 @@ class Handler(BaseHTTPRequestHandler):
                 out = run_orient(raw, q.get("name", ["part.stl"])[0],
                                  q.get("profile", [""])[0],
                                  q.get("axis", ["none"])[0])
+                self._send(200, json.dumps(out), JSON)
+            elif p == "/fix":
+                if not raw:
+                    self._send(200, _err_json("File missing."), JSON)
+                    return
+                from dfam_intent import parse_keep
+                out = run_fix(raw, q.get("name", ["part.stl"])[0],
+                              q.get("profile", [""])[0],
+                              q.get("auto_ex", ["1"])[0] == "1",
+                              parse_keep(q.get("keep", [])),
+                              json.loads(q.get("sculpt", ["[]"])[0]))
                 self._send(200, json.dumps(out), JSON)
             elif p == "/diff":
                 obj = json.loads(raw.decode())
@@ -357,16 +427,9 @@ _LANDING = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
   .foot{color:var(--dim);font-size:12px;margin-top:18px;text-align:center}
 </style></head><body><div class="wrap">
   <header>
-    <svg width="52" height="52" viewBox="0 0 100 100">
-      <ellipse cx="50" cy="86" rx="34" ry="7" stroke="#e8eaed" stroke-width="2.6" fill="none"/>
-      <path d="M50 8 C48 14 46 20 43 27 C40 34 36 42 32 51 C28 60 24 70 22 82 L78 82 C76 70 72 60 68 51 C64 42 60 34 57 27 C54 20 52 14 50 8 Z" fill="#e8eaed"/>
-      <path d="M34 46 Q50 52 66 46 M30 57 Q50 64 70 57 M26 69 Q50 77 74 69 M39 35 Q50 39 61 35" stroke="#14171c" stroke-width="3.2" fill="none"/>
-      <line x1="50" y1="10" x2="50" y2="84" stroke="#14171c" stroke-width="2.4"/>
-      <circle cx="50" cy="22" r="3.2" fill="#14171c" stroke="#e8eaed" stroke-width="1.7"/>
-      <circle cx="50" cy="50" r="3.2" fill="#14171c" stroke="#e8eaed" stroke-width="1.7"/>
-      <circle cx="50" cy="80" r="3.6" fill="#14171c" stroke="#e8eaed" stroke-width="1.7"/>
-    </svg>
-    <h1>stalagmite <span>toolkit</span></h1>
+    <img src="__LOGO__" alt="STALAGMITE — The transition IS the design"
+         style="height:58px">
+    <h1><span>toolkit</span></h1>
   </header>
   <p class="tag">Make stalagmites, not stalactites.</p>
 
@@ -434,7 +497,10 @@ _LANDING = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <div id="viewer">
   <div class="vbar">
     <button id="v-back">&larr; New audit</button>
+    <span id="v-verdict" style="font-size:13px;color:var(--dim)"></span>
     <span class="vsp"></span>
+    <a id="v-dlstl" class="vbtn" style="display:none">Download fixed STL</a>
+    <button id="v-fix">Auto-fix &amp; re-audit</button>
     <a id="v-open" class="vbtn" target="_blank">Open in new tab</a>
     <a id="v-dl" class="vbtn">Download report</a>
   </div>
@@ -488,6 +554,78 @@ document.getElementById('go-audit').onclick = async () => {
 document.getElementById('v-back').onclick=()=>{
   document.getElementById('viewer').style.display='none';
   document.getElementById('vframe').src='about:blank';
+  document.getElementById('v-verdict').textContent='';
+  const dl0=document.getElementById('v-dlstl');
+  dl0.style.display='none'; dl0.textContent='Download fixed STL';
+  dl0.style.borderColor=''; dl0.style.color='';
+  const vf=document.getElementById('v-fix');
+  vf.style.display=''; vf.textContent='Auto-fix & re-audit';
+  vKeep=[]; vSculpt=[];
+};
+// keep-clear zones + sculpt state pushed up by the report
+let vKeep=[], vSculpt=[];
+window.addEventListener('message', e=>{
+  const d=e.data;
+  if(d && d.stalagmite==='keep'){
+    vKeep=d.zones||[];
+    const vd=document.getElementById('v-verdict');
+    vd.textContent = vKeep.length
+      ? vKeep.length+' defect(s) protected — Auto-fix will keep clear'
+      : '';
+  }
+  if(d && d.stalagmite==='sculpt'){
+    vSculpt=d.entries||[];
+    const custom = vSculpt.some(x=>x.height!==undefined||x.optional);
+    document.getElementById('v-fix').textContent =
+      custom ? 'Apply sculpt & re-audit' : 'Auto-fix & re-audit';
+  }
+});
+document.getElementById('v-fix').onclick = async () => {
+  if(!fAudit) return;
+  const vb=document.getElementById('v-fix'); vb.disabled=true;
+  const vd=document.getElementById('v-verdict');
+  vd.textContent='fixing: building repairs, unioning, re-auditing ...';
+  const buf=await fAudit.arrayBuffer();
+  const qs=new URLSearchParams({name:fAudit.name,
+    profile:document.getElementById('prof-audit').value,
+    auto_ex:document.getElementById('ax-audit').checked?'1':'0'});
+  vKeep.forEach(z=>qs.append('keep', z.join(':')));
+  if(vSculpt.length) qs.set('sculpt', JSON.stringify(vSculpt));
+  try {
+    const r=await fetch('/fix?'+qs,{method:'POST',body:buf});
+    const j=await r.json();
+    if(!j.ok){ vd.textContent='fix error: '+(j.error||'unknown'); vb.disabled=false; return; }
+    const nblk=(j.notes||[]).filter(n=>n.indexOf('keep-clear')>=0).length;
+    vd.innerHTML=`<b style="color:${j.verdict==='VERIFIED'?'#3fb96a':
+      j.verdict==='PARTIAL'?'#f08c14':'#9aa4b2'}">${j.verdict}</b> `+
+      `${j.status_before} &rarr; ${j.status_after} &middot; `+
+      `${j.fails_before-j.fails_after} fail(s) cleared`+
+      (nblk?` &middot; <span style="color:#7b5cd6">${nblk} repair(s) `+
+            `withheld (protected)</span>`:'')+
+      (j.verdict==='NOT_IMPROVED'
+        ? ' &middot; <span style="color:#9aa4b2">output withheld '+
+          '(never-worse) — showing the re-audited attempt</span>':'');
+    if(j.stl_b64){
+      const stl=Uint8Array.from(atob(j.stl_b64),c=>c.charCodeAt(0));
+      const dl=document.getElementById('v-dlstl');
+      dl.href=URL.createObjectURL(new Blob([stl],{type:'model/stl'}));
+      dl.download=j.stl_name; dl.style.display='';
+      const forced = j.verdict==='NOT_IMPROVED';
+      dl.textContent = forced
+        ? 'Download attempt STL (still fails)' : 'Download fixed STL';
+      dl.style.borderColor = forced ? '#f08c14' : '';
+      dl.style.color = forced ? '#f08c14' : '';
+    }
+    if(j.fixed_report){
+      const url=URL.createObjectURL(new Blob([j.fixed_report],{type:'text/html'}));
+      document.getElementById('vframe').src=url;
+      document.getElementById('v-open').href=url;
+      const dr=document.getElementById('v-dl');
+      dr.href=url; dr.download=(j.stl_name||'part').replace(/\.stl$/,'')+'_report.html';
+      vb.style.display='none';       // already fixed
+    }
+  } catch(e){ vd.textContent='fix error: '+e; }
+  vb.disabled=false;
 };
 
 // ---- ORIENT

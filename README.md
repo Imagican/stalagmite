@@ -1,4 +1,6 @@
-# stalagmite
+<p align="center">
+  <img src="logo.png" alt="STALAGMITE — The transition IS the design" width="560">
+</p>
 
 **Make stalagmites, not stalactites.** Stalagmites grow from the ground
 and stand; stalactites hang and need support. Stalagmite mechanically
@@ -77,6 +79,11 @@ Machine-readable output for scripts and CI, three equivalent ways in:
 Bash — exit code only (simplest gate):
 
     stalagmite part.stl --auto-ex || { echo "not printable"; exit 1; }
+
+Exit codes: **0** = printable (PASS / PASS_WITH_LIMITS / REVIEW),
+**1** = FAIL, **2** = could not audit (unreadable/empty mesh — with
+`--json` this is an `{"status":"ERROR",...}` object, never a traceback).
+Treat both 1 and 2 as "do not ship."
 
 Bash — full JSON to log/parse (`--json` prints one object; exit code
 unchanged: 0 = PASS/PASS_WITH_LIMITS/REVIEW, 1 = FAIL):
@@ -187,6 +194,180 @@ accept (judged bridge / functional flat per DFAM_RULES #4 and #7), or
 reorient (Tier 4). Always re-audit after applying a repair — fixes can
 create new overhangs (Adam & Zimmer 2014).
 
+## From telling to doing: sculptable repair geometry
+
+Fail defects don't just get advice — they get **real, adjustable repair
+geometry**, built by lofting between contours taken from the actual
+audited slices (a hex flange gets a hex-to-neck cone; a rectangular
+ledge gets its true rectangular footprint — never an invented
+primitive).
+
+In the report, selecting a fail defect shows a translucent green
+repair body with three sliders — **Height**, **Easing** (straight
+chamfer → concave fillet) and **Flare** — so you sculpt the fix to
+taste. Physics is a hard constraint, not a suggestion: the height
+slider cannot go below what the profile's angle permits, a live badge
+shows the worst slope, and nothing can extend below the build plate.
+**Download repair STL** exports your sculpted body, union-ready.
+
+From the CLI: `--emit-fix repairs.stl` writes the default (minimum,
+straight-chamfer) bodies for all fail features. Union them into the
+part in any CAD, then re-audit — on the regression suite this turns
+the worst fixture from FAIL into REVIEW with zero fail features left.
+
+## Repair primitives: the fix must respect the design
+
+The repair generator picks its move from the defect's anchoring, not
+one-size-fits-all:
+
+| defect signature | primitive | what it builds |
+|---|---|---|
+| reachable support below | **loft** | morph down to real support contours |
+| nothing below | **pillar** | ground the footprint to the bed |
+| flat internal ceiling, anchored all around (bottle-cap roof) | **roof chamfer** | a corbelled cone ring climbing from the wall to the ceiling |
+
+The roof chamfer is the real-world bottle-cap case: a downward loft
+would plug the whole cavity and swallow the spigot bore. Instead the
+chamfer closes the opening inward layer by layer at the profile angle —
+**the cavity stays hollow and bores stay open** (it stops at the bore's
+edge). It's exactly what a designer would model by hand: chamfer the
+roof into a gentle cone. In the report the part goes x-ray while you
+sculpt the funnel; extra small roof holes that the cone may cover are
+called out in the notes.
+
+Through-holes survive the chamfer: the main bore bounds the closure,
+and every **secondary roof hole (vents!) gets a vertical clearance
+shaft drilled through the applied body** — a vent that stops at the
+chamfer is not a vent. (True booleans via `manifold3d`, now a
+dependency; if drilling ever fails the notes say so honestly instead
+of covering the hole silently.)
+
+The chamfer also respects **functional wall geometry**: exclusion zones
+(the threads you `--ex`'d or auto-detected) and keep-clear zones on the
+opening's wall clamp the chamfer's attachment ABOVE them. If a full
+cone no longer fits, a partial closure is used when its residual ledge
+stays within allowance — proven by re-audit. If even that doesn't hold,
+the automated fix refuses (never-worse) and tells you the truth: this
+cap needs its roof raised or its threads shortened — a design change
+(`stalagmite-autofix` can search for it if the design is parametric).
+The sculptor still shows the flagged partial ghost with a red badge so
+you can judge the droop yourself.
+
+Repairs are not only for failures: in the report, **every defect card
+is sculptable** — tolerable ledges and judged bridges get a gold
+*"Optional quality repair"* panel (same sliders, same STL download) for
+when within-allowance still isn't the surface finish you want.
+Automation never applies optional repairs; they exist for you.
+
+## Fix it for me: `stalagmite-fix`
+
+The full apply-and-prove loop in one command:
+
+    stalagmite-fix part.stl -o part_fixed.stl --auto-ex
+
+It audits, builds the repair bodies, boolean-unions them into the part
+(manifold3d if available, graceful fallbacks otherwise), **re-audits the
+result under the same profile**, and issues a matched-feature verdict:
+
+| verdict | meaning |
+|---|---|
+| VERIFIED | every fail resolved, nothing regressed — proven by re-audit |
+| PARTIAL | fails reduced but some remain |
+| NOTHING_TO_FIX | no fail defects to begin with |
+| NOT_IMPROVED | repairs didn't help — **output withheld** (`--force` to override) |
+
+That last row is the never-worse guarantee: stalagmite will not hand you
+a "fixed" file that audits worse than what you gave it. `--height /
+--easing / --flare` shape the repairs (same parameters as the report's
+sculptor), `--report fixed.html` writes an interactive report of the
+fixed part, `--json` emits the machine object, and exit codes follow the
+audit contract (0 printable / 1 still failing / 2 error).
+
+In the GUI, the report view has an **Auto-fix & re-audit** button: one
+click swaps in the fixed part's report with a verdict banner and a
+Download-fixed-STL button. Python: `stalagmite.fix(part)` returns the
+same result object (`.verdict`, `.mesh_fixed`, `.write(path)`,
+`.to_dict()`).
+
+On the regression suite: the worst fixture goes FAIL → REVIEW,
+0 fail features, `FIX: VERIFIED` — the tool repairs the part and proves
+its own repair.
+
+## Fix the design, not the mesh: `stalagmite-autofix`
+
+`stalagmite-fix` welds repair geometry onto a finished mesh.
+`stalagmite-autofix` goes one level up: hand it your **parametric build
+function** and the knobs you're willing to move, and it searches for the
+*smallest* move away from your intended design that makes the part
+printable — every candidate is rebuilt from source and fully audited.
+
+A design file is plain Python (CadQuery, trimesh, whatever
+`stalagmite.check` accepts):
+
+    PARAMS  = {"shelf_len": (3.0, 10.0), "gusset": (0.0, 1.0)}
+    NOMINAL = {"shelf_len": 10.0, "gusset": 0.0}   # what you *wanted*
+
+    def build(shelf_len, gusset):
+        return make_my_part(...)                   # CadQuery or trimesh
+
+    # then:
+    stalagmite-autofix my_design.py -o best.stl --budget 32
+
+Search = the same numpy-only GP Bayesian optimisation as the orientation
+solver, followed by a **homing pass** that pulls each parameter
+individually back toward its nominal value, shaving off every bit of
+design change the physics doesn't actually demand. The winner is rebuilt
+fresh and re-audited before anything is written.
+
+| verdict | meaning |
+|---|---|
+| NOTHING_TO_DO | your nominal design already audits printable |
+| FOUND | a printable parameter set located and proven — the moves are listed |
+| NONE_FOUND | nothing printable in the box — **output withheld** (`--force` to override) |
+
+Output tells you exactly what moved and how far
+(`shelf_len: 10 → 7.6 (−2.4)`, `design moved 0.57` on a 0–1 scale).
+Python: `stalagmite.autofix(build, PARAMS, NOMINAL)` returns the same
+result object. Try it: `stalagmite-autofix examples/autofix_demo.py` — a
+design whose parameter box contains a trap (shrinking the shelf can
+never fix it; the search has to discover the gusset).
+
+## Design-intent tags: `--keep`
+
+An exclusion zone (`--ex`) says *"ignore violations here — I know
+better"* (thread helices). A keep-clear zone says the opposite: *"this
+region is functional — a seal face, a bore, a mating surface — and no
+generated repair may touch it."* Same cylinder syntax:
+
+    stalagmite part.stl --keep 25:33:6:17.4:0        # zlo:zhi:rmax[:cx:cy]
+    stalagmite-fix part.stl --keep 25:33:6:17.4:0 -o fixed.stl
+
+The audit flags any defect sitting on a tagged surface
+(`[ON KEEP-CLEAR ZONE]` in text, `intent_hits` in JSON, a purple badge
+in the report) — so you know a defect is on functional geometry *before*
+deciding how to fix it. `stalagmite-fix` then honours the tag twice:
+anchor walk-downs skip landings on tagged material, and any repair body
+that would still poke into a zone is **dropped with a note** instead of
+welded onto your seal face. If that leaves a fail unfixed, the verdict
+says so honestly (PARTIAL / NOT_IMPROVED) — intent never silently
+degrades the audit's truthfulness.
+
+**In the GUI there are no coordinates at all.** Run an audit, and
+every defect card in the report gets a **protect** toggle. Click it and
+that defect's own geometry becomes the keep-clear zone; the viewer bar
+confirms *"1 defect(s) protected — Auto-fix will keep clear"*, and
+Auto-fix reports any withheld repairs right in the verdict banner
+(*"1 repair(s) withheld (protected)"*).
+
+From Python, intent can live next to the design instead of in flags —
+including straight from CadQuery named faces:
+
+    zone = stalagmite.keep_zone(part.faces(">Z"), pad=1)   # the gland seat
+    stalagmite.fix(part, keep=[zone]).write("fixed.stl")
+
+`keep_zone()` also accepts a trimesh, an (n,3) point array, or explicit
+bounds.
+
 ## Tier 2: violation classification
 
 Every violation is classified by in-plane anchoring and given a severity
@@ -235,8 +416,17 @@ Face modes: `floor` (normal ends up facing down), `up`, `wall`
 process Bayesian optimisation (Matérn 5/2, LCB), ~35 evaluations, after
 Goguelin, Dhokia & Flynn 2021; the objective is their support-ray-length
 proxy plus heavily weighted constraint penalties (15° of violation ≈ the
-worst-case support cost). Always re-audit the oriented mesh with
-`dfam_audit.py` before printing.
+worst-case support cost).
+
+**The proxy proposes, the audit disposes.** By default the solver then
+re-ranks its 3 best distinct poses with the FULL containment audit
+(`--verify-top K`, 0 to disable): the winner is the pose with the fewest
+fail features, then fewest judged bridges, then the proxy score — so a
+pose that merely *looks* cheap to support can't beat one that actually
+passes physics. Exclusion zones are remapped into each pose's build
+frame when the pose keeps their axis vertical; tilted-axis poses are
+audited without them (conservative) and say so. The chosen pose's audit
+evidence rides along in the result (`chosen_by`, `audit`, `verified`).
 
 ## Python API — `import stalagmite`
 
@@ -282,10 +472,16 @@ See `examples/cadquery_demo.py` for a runnable version that lets the audit
 ## Robustness
 
 `load_mesh()` sanitises input (drops infinite/NaN coords and degenerate/
-duplicate faces, merges coincident vertices, concatenates scenes) and
-`mesh_health()` caveats non-watertight meshes, inconsistent winding, and
-suspicious units — so real-world and messy STLs are audited without
-crashing, with an honest note about how much to trust the result.
+duplicate faces, merges coincident vertices, concatenates scenes, and
+auto-flips inside-out meshes) and `mesh_health()` caveats non-watertight
+meshes, inconsistent winding, suspicious units, and very high slice
+counts — so real-world and messy STLs are audited without crashing, with
+an honest note about how much to trust the result. A dedicated torture
+battery (`test_robustness.py`) keeps it that way: open meshes, inverted
+normals, NaN/inf vertices, self-intersections, disconnected shells,
+zero-height plates, garbage files, ASCII STLs and 20k-face organics all
+either audit cleanly or fail with a clear error (exit 2), never a
+traceback.
 
 ## Tests
 

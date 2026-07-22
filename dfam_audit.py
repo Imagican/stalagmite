@@ -121,23 +121,46 @@ def sanitize_mesh(mesh):
             op()
         except Exception:
             pass
+    # inside-out mesh (consistently inverted normals): watertight but
+    # negative volume. Flip it -- the audit is meaningless otherwise.
+    try:
+        if len(m.faces) and m.is_watertight and m.volume < 0:
+            m.invert()
+    except Exception:
+        pass
+    return m
+
+
+def _require_usable(m, origin="input"):
+    if (not isinstance(m, trimesh.Trimesh) or len(m.faces) == 0
+            or m.bounds is None):
+        raise ValueError(
+            f"no usable triangle mesh in {origin} (empty, faceless, or "
+            f"degenerate after clean-up)")
     return m
 
 
 def load_mesh(path):
     """Load any trimesh-supported file into a single sanitized Trimesh.
-    Concatenates scenes; raises ValueError on empty / non-mesh input."""
-    m = trimesh.load(path, force="mesh")
+    Concatenates scenes; raises ValueError on empty / non-mesh /
+    unreadable input (never lets a parser exception escape raw)."""
+    try:
+        m = trimesh.load(path, force="mesh")
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"could not read {path} as a mesh "
+                         f"({type(e).__name__}: {e})")
     if isinstance(m, trimesh.Scene):
         if not m.geometry:
             raise ValueError(f"no geometry found in {path}")
         m = trimesh.util.concatenate(tuple(m.geometry.values()))
     if not isinstance(m, trimesh.Trimesh) or len(m.faces) == 0:
         raise ValueError(f"could not load a triangle mesh from {path}")
-    return sanitize_mesh(m)
+    return _require_usable(sanitize_mesh(m), path)
 
 
-def mesh_health(mesh):
+def mesh_health(mesh, dz=None):
     """Return human-readable health notes (empty = clean). These do not
     fail the audit; they caveat how much to trust it."""
     notes = []
@@ -147,8 +170,12 @@ def mesh_health(mesh):
                          "approximate near boundaries")
         if not mesh.is_winding_consistent:
             notes.append("inconsistent face winding -- normals unreliable")
+        if mesh.is_watertight and mesh.volume < 0:
+            notes.append("inside-out (inverted normals) -- audit unreliable")
     except Exception:
         pass
+    if mesh.bounds is None:
+        return notes + ["no geometry bounds"]
     ext = mesh.bounds[1] - mesh.bounds[0]
     if float(ext[2]) < 1e-6:
         notes.append("near-zero build height -- nothing to slice")
@@ -159,14 +186,77 @@ def mesh_health(mesh):
     elif mx > 2000:
         notes.append(f"very large (max dim {mx:.0f}mm) -- check units "
                      f"(stalagmite assumes millimetres)")
+    if dz:
+        n_slices = float(ext[2]) / dz
+        if n_slices > 2500:
+            notes.append(f"~{n_slices:.0f} slices at {dz}mm layers -- "
+                         f"audit may be slow; a coarser --dz speeds it up")
     return notes
+
+
+def _mesh_bodies(mesh):
+    """Split the mesh for slicing, memoized on the mesh object.
+    Returns (watertight_bodies, open_shell_group_or_None).
+
+    Within ONE closed shell, section-loop nesting is a true even-odd
+    hole structure; across closed shells it is not (a separate solid
+    sitting inside another body's outline is NOT a hole -- e.g. a
+    repair body unioned by shell concatenation). So watertight bodies
+    are sliced independently and unioned. Open surface components can
+    legitimately BE another component's hole wall (some generators emit
+    annuli as separate tubes), so all open shells stay grouped and are
+    resolved together by global even-odd nesting."""
+    cached = getattr(mesh, "_sm_bodies", None)
+    if cached is not None:
+        return cached
+    closed, open_grp = [mesh], None
+    try:
+        parts = list(mesh.split(only_watertight=False))
+        if len(parts) > 1:
+            closed = [b for b in parts if b.is_watertight]
+            open_ = [b for b in parts if not b.is_watertight]
+            if not closed:
+                closed, open_grp = [mesh], None    # all open: old path
+            elif open_:
+                import trimesh as _tm
+                open_grp = _tm.util.concatenate(open_)
+    except Exception:
+        closed, open_grp = [mesh], None
+    out = (closed, open_grp)
+    try:
+        mesh._sm_bodies = out
+    except Exception:
+        pass
+    return out
 
 
 def slice_region(mesh, z):
     """World-space cross-section region at height z (no 2D frame, so
     cross-slice comparison never hallucinates on asymmetric parts).
-    Returns a shapely (Multi)Polygon or None. Fully guarded so a bad
-    section on a noisy mesh yields None rather than crashing the run."""
+    Returns a shapely (Multi)Polygon or None. Multi-body meshes are
+    resolved per _mesh_bodies (watertight bodies independent, open
+    shells grouped) and unioned."""
+    closed, open_grp = _mesh_bodies(mesh)
+    if len(closed) == 1 and open_grp is None:
+        return _section_region(closed[0], z)
+    regions = [_section_region(b, z) for b in closed]
+    if open_grp is not None:
+        regions.append(_section_region(open_grp, z))
+    regions = [r for r in regions if r is not None and not r.is_empty]
+    if not regions:
+        return None
+    try:
+        from shapely.ops import unary_union
+        u = unary_union(regions)
+        return None if u.is_empty else u
+    except Exception:
+        return regions[0]
+
+
+def _section_region(mesh, z):
+    """Even-odd section region of ONE mesh shell at height z. Fully
+    guarded so a bad section on a noisy mesh yields None rather than
+    crashing the run."""
     try:
         sec = mesh.section(plane_origin=[0, 0, z], plane_normal=[0, 0, 1])
         if sec is None:
@@ -182,16 +272,31 @@ def slice_region(mesh, z):
                     polys.append(p)
             except Exception:
                 continue
-        polys.sort(key=lambda p: p.area, reverse=True)
-        region = None
-        for p in polys:
-            if region is None:
-                region = p
-            elif region.contains(p.representative_point()):
-                region = region.difference(p)
-            else:
-                region = region.union(p)
-        return region
+        if not polys:
+            return None
+        if len(polys) == 1:
+            return polys[0]
+        # nesting depth decides holes (even-odd), exactly as a manifold
+        # section nests. Loops that CROSS or coincide (overlapping
+        # shells from concatenated bodies) are strictly-nested in
+        # nothing -- they are solid and get unioned, never XORed.
+        from shapely.ops import unary_union
+        pos, neg = [], []
+        for i, p in enumerate(polys):
+            depth = 0
+            for j, q in enumerate(polys):
+                if j == i or q.area <= p.area:
+                    continue
+                try:
+                    if p.within(q.buffer(0.01)):
+                        depth += 1
+                except Exception:
+                    continue
+            (neg if depth % 2 else pos).append(p)
+        region = unary_union(pos)
+        if neg:
+            region = region.difference(unary_union(neg))
+        return None if region.is_empty else region
     except Exception:
         return None
 
@@ -572,11 +677,26 @@ def aggregate(violations, dz=0.4):
     for f in features:
         if f["cls"] == "bridge" and f["geom"] is not None:
             try:
-                mrr = f["geom"].minimum_rotated_rectangle
-                xs, ys = mrr.exterior.coords.xy
-                e1 = np.hypot(xs[1] - xs[0], ys[1] - ys[0])
-                e2 = np.hypot(xs[2] - xs[1], ys[2] - ys[1])
-                f["roof_width"] = float(min(e1, e2))
+                g = f["geom"]
+                comps = list(g.geoms) if g.geom_type == "MultiPolygon" \
+                    else [g]
+                if any(len(c.interiors) for c in comps):
+                    # annular roof (ring around an open hole): the MRR
+                    # minor axis measures the OUTER diameter, wildly
+                    # overstating the span -- the physical width being
+                    # roofed is twice the max inscribed radius
+                    from shapely.ops import polylabel
+                    w = 0.0
+                    for c in comps:
+                        p = polylabel(c, 0.05)
+                        w = max(w, 2.0 * c.boundary.distance(p))
+                    f["roof_width"] = float(w)
+                else:
+                    mrr = g.minimum_rotated_rectangle
+                    xs, ys = mrr.exterior.coords.xy
+                    e1 = np.hypot(xs[1] - xs[0], ys[1] - ys[0])
+                    e2 = np.hypot(xs[2] - xs[1], ys[2] - ys[1])
+                    f["roof_width"] = float(min(e1, e2))
                 if f["roof_width"] > BRIDGE_MAX and f["severity"] != "fail":
                     f["severity"] = "fail"
             except Exception:
@@ -587,7 +707,7 @@ def aggregate(violations, dz=0.4):
 
 
 def result_dict(part, status, features, bed_area, profile_name,
-                thresholds, health, exclude, auto_zones=None):
+                thresholds, health, exclude, auto_zones=None, keep=()):
     """JSON-serialisable summary of an audit -- the shape returned by
     `--json` and by stalagmite.AuditResult.to_dict(). This is the stable
     machine interface: gate/log against these keys."""
@@ -607,6 +727,8 @@ def result_dict(part, status, features, bed_area, profile_name,
             d["roof_width_mm"] = round(f["roof_width"], 2)
         if f.get("repairs"):
             d["repairs"] = f["repairs"]
+        if f.get("intent_hits"):
+            d["intent_hits"] = f["intent_hits"]   # keep-zone indices
         return d
     return {
         "part": part,
@@ -622,6 +744,7 @@ def result_dict(part, status, features, bed_area, profile_name,
         "feature_count": len(features),
         "features": [feat(f) for f in features],
         "exclusions": [list(_ex_parts(e)) for e in exclude],
+        "keep_zones": [list(_ex_parts(k)) for k in (keep or [])],
         "auto_zones": [
             {"zlo": round(z["zlo"], 2), "zhi": round(z["zhi"], 2),
              "rmax": round(z["rmax"], 2),
@@ -633,7 +756,8 @@ def result_dict(part, status, features, bed_area, profile_name,
 
 
 def audit(path, exclude=(), export=None, suggest=False, auto_ex=False,
-          report=None, profile=None, lint=True, as_json=False):
+          report=None, profile=None, lint=True, as_json=False,
+          emit_fix=None, keep=()):
     """CLI-style audit: load, run, print report. Returns the four-state
     status string (see overall_status / STATUS_BLURB).
 
@@ -654,7 +778,7 @@ def audit(path, exclude=(), export=None, suggest=False, auto_ex=False,
 
     m = load_mesh(path)
     exclude = list(exclude)
-    health = mesh_health(m)
+    health = mesh_health(m, dz)
     say(f"== stalagmite audit: {path} ==")
     say(f"   {profile.summary_line()}")
     for note in health:
@@ -682,6 +806,9 @@ def audit(path, exclude=(), export=None, suggest=False, auto_ex=False,
                                         min_wall=min_wall,
                                         warnings_out=warnings)
     feats = aggregate(violations, dz)
+    if keep:
+        from dfam_intent import annotate_features
+        annotate_features(feats, keep)
     if suggest or report or as_json:
         suggest_repairs(m, feats, dz, max_angle)
     status = overall_status(feats, warnings)
@@ -689,6 +816,14 @@ def audit(path, exclude=(), export=None, suggest=False, auto_ex=False,
     if export:
         n = export_colored(m, violations, dz, export)
         say(f"violation mesh written: {export} ({n} faces painted)")
+    if emit_fix:
+        from dfam_repair import emit_fix_stl
+        nb = emit_fix_stl(m, feats, emit_fix, dz, max_angle, keep=keep,
+                          avoid=exclude)
+        say(f"repair bodies written: {emit_fix} ({nb} body(ies)) -- "
+            f"union into the part, then re-audit" if nb else
+            f"no fail features needing repair bodies ({emit_fix} not "
+            f"written)")
     if report:
         from dfam_report import write_report
         write_report(m, violations, feats, report,
@@ -705,7 +840,8 @@ def audit(path, exclude=(), export=None, suggest=False, auto_ex=False,
                       "warn_angle": warn_angle}
         print(json.dumps(result_dict(
             path.split("/")[-1].split("\\")[-1], status, feats, first_area,
-            profile.name, thresholds, health, exclude, auto_zones)))
+            profile.name, thresholds, health, exclude, auto_zones,
+            keep)))
         return status
 
     say(f"bed contact: {first_area:.0f} mm2")
@@ -737,10 +873,12 @@ def audit(path, exclude=(), export=None, suggest=False, auto_ex=False,
                 else:
                     fre = max((v.free_span or 0) for v in f["layers"])
                     dims = f", free span {fre:.1f}mm"
+            tag = " [ON KEEP-CLEAR ZONE]" if f.get("intent_hits") else ""
             print(f"  [{f['severity']:9s}] {f['cls']:13s} "
                   f"z {f['zlo']:.1f}-{f['zhi']:.1f} "
                   f"({len(f['layers'])} layer(s)"
-                  f", @({v0.centroid[0]:.0f},{v0.centroid[1]:.0f}){dims})")
+                  f", @({v0.centroid[0]:.0f},{v0.centroid[1]:.0f}){dims})"
+                  f"{tag}")
             for r in f.get("repairs", []):
                 print(f"      -> {r}")
     print(f"STATUS: {status} -- {STATUS_BLURB[status]}")
@@ -941,6 +1079,14 @@ def main(argv=None):
     ap.add_argument("--json", action="store_true",
                     help="emit one machine-readable JSON object instead of "
                          "the human report (exit code unchanged)")
+    ap.add_argument("--emit-fix", metavar="OUT.stl", default=None,
+                    help="write union-ready repair bodies for fail "
+                         "features (real slice-contour lofts)")
+    ap.add_argument("--keep", action="append", default=[],
+                    metavar="ZLO:ZHI:RMAX[:CX:CY]",
+                    help="design-intent keep-clear zone (functional "
+                         "surface): defects touching it are flagged and "
+                         "no emitted repair may enter it")
     a = ap.parse_args(argv)
     import dfam_profiles
     if a.list_profiles:
@@ -959,9 +1105,25 @@ def main(argv=None):
     except (KeyError, OSError, ValueError) as e:
         ap.error(str(e))
     ex = [tuple(map(float, e.split(":"))) for e in a.ex]
-    status = audit(a.stl, ex, export=a.export, suggest=a.suggest,
-                   auto_ex=a.auto_ex, report=a.report,
-                   profile=profile, lint=not a.no_lint, as_json=a.json)
+    try:
+        if a.keep:
+            from dfam_intent import parse_keep
+            keep = parse_keep(a.keep)
+        else:
+            keep = []
+        status = audit(a.stl, ex, export=a.export, suggest=a.suggest,
+                       auto_ex=a.auto_ex, report=a.report,
+                       profile=profile, lint=not a.no_lint, as_json=a.json,
+                       emit_fix=a.emit_fix, keep=keep)
+    except (ValueError, OSError) as e:
+        # bad/unreadable input: exit 2 (distinct from FAIL=1), no traceback
+        if a.json:
+            print(json.dumps({"status": "ERROR", "printable": False,
+                              "exit_code": 2, "error": str(e),
+                              "part": a.stl}))
+        else:
+            print(f"error: {e}", file=sys.stderr)
+        return 2
     return STATUS_EXIT.get(status, 1)
 
 
