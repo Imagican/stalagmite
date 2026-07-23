@@ -79,9 +79,3 @@ worse. Everything is a flag, nothing is hardcoded. The regression suite
 (`python -m pytest test_fixtures.py`) should always pass; if it doesn't
 after you edit something, the baseline in FIXTURES.md is the truth.
 
-## Publishing it (when you're ready)
-
-Install GitHub Desktop (desktop.github.com), sign up free, "Add local
-repository" → this folder, then "Publish repository". That's the whole
-git story. `LITERATURE.md` has every citation you'd want for a README
-or a writeup.
