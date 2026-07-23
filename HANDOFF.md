@@ -996,3 +996,56 @@ Housekeeping release; no engine changes.
   shallower funnels; keep on roadmap.
 Suite: 175 passed (12 new: 8 corpus, 3 batch, 1 badge).
 GitHub v0.14 / PyPI 0.7.0 -- catch-up 0.15-0.34.
+
+## Status 2026-07-22 (v0.35.0) — STAGE D: SOURCE PATCHING
+
+The fix moves upstream: stalagmite-patch emits each repair as a
+parametric snippet (OpenSCAD or CadQuery) to paste into the ORIGINAL
+design, so re-exports stop reintroducing the defect (dfam_patch.py).
+- Snippets are honest CIRCLE FITS of the audited slice contours:
+  every fix header declares fitted radius + max deviation; visibly
+  non-circular contours (rect ledges, crescents) get a WARNING
+  comment. roofcone -> difference(cylinder, cone void, bore, vents);
+  skirt -> cone minus inner column (tube stays hollow, 0.3 bite);
+  loft/pillar -> hull()/loft() between fitted circles.
+- PARAMETRIC PREVIEW: before writing, the snippet geometry is rebuilt
+  as a mesh (same builders as Stage B), unioned, RE-AUDITED, and the
+  verdict printed + wired into the exit code (0 only when VERIFIED
+  and nothing blocked). --no-verify skips.
+- Blocked repairs (thread clamp, no usable wall) are emitted as
+  comments quoting the audit refusal, never as geometry. flat_roof:
+  partial cone + blocked note + NOT_IMPROVED, exit 1 -- consistent
+  with Stage B's honest verdict.
+- GOLD-STANDARD TEST: emitted .scad rendered by the REAL openscad
+  binary, unioned, re-audited -> cap FAIL becomes PASS, VERIFIED
+  (test skips gracefully where openscad is absent).
+Suite: 184 passed (9 new in test_patch.py). New console script
+stalagmite-patch; module dfam_patch registered.
+GitHub/PyPI: user pushed the 0.15-0.34 catch-up TODAY (both live at
+0.34.0). Next release ritual is routine again: commit/push, build,
+twine upload 0.35.0.
+
+## Status 2026-07-22 (v0.36.0) — GUI BATCH TAB + CLICKABLE STAGE D
+
+Both GUI conveniences the user asked for ("continue with both"):
+- BATCH TAB (4th tab): drop/select MULTIPLE parts -> each audited in
+  turn via new /batchrow route (run_batch_row: bytes -> status/fails/
+  judge/tolerable/exit/seconds). Live table with status badges, rolling
+  summary counts, per-row "report" button that opens the FULL viewer
+  for that part (openReport() refactor -- viewer context vProf/vAx now
+  travels with whichever file opened it, so Auto-fix / sculpt / Patch
+  all work from a batch row too).
+- PATCH SOURCE BUTTON (viewer bar): language select (OpenSCAD /
+  CadQuery) + "Patch source" -> new /patch route (run_patch) runs the
+  full Stage D pipeline server-side incl. the parametric preview
+  re-audit; browser downloads <part>_patch.scad/.py and the verdict
+  line shows "N fix(es), M blocked · preview VERIFIED (PASS) · paste
+  into your ORIGINAL design". Keep-clear (protect) zones pass through.
+  NOTHING_TO_PATCH and unknown-language paths handled.
+Playwright E2E (cloud, chromium): batch of 2 parts -> 2 badges +
+summary; row report -> viewer; Patch source -> real .scad download
+containing stalagmite_fix_1, verdict VERIFIED (PASS); lang switch ->
+.py download. Suite: 188 passed (4 new: 2 batchrow/landing in
+test_batch, 2 run_patch/landing in test_patch).
+GitHub/PyPI at 0.34.0 -- user should push+upload 0.35.0/0.36.0
+(routine: commit/push, delete dist, build, twine upload).

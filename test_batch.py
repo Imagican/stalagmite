@@ -44,3 +44,19 @@ def test_main_rejects_non_folder(tmp_path, capsys):
     empty = tmp_path / "empty"
     empty.mkdir()
     assert dfam_batch.main([str(empty)]) == 2   # no meshes found
+
+
+def test_gui_batchrow_helper():
+    """The Batch tab's server half: bytes -> one table row."""
+    import dfam_gui
+    raw = open(os.path.join(FIX, "02_teardrop_floating.stl"), "rb").read()
+    row = dfam_gui.run_batch_row(raw, "02.stl", "", False)
+    assert row["ok"] and row["status"] == "FAIL" and row["fails"] == 4
+    assert row["exit_code"] == 1 and row["seconds"] >= 0
+
+
+def test_gui_landing_has_batch_tab():
+    import dfam_gui
+    h = dfam_gui._landing()
+    for frag in ('data-t="batch"', "p-batch", "go-batch", "/batchrow"):
+        assert frag in h, frag

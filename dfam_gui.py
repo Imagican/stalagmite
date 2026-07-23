@@ -5,10 +5,15 @@ the command line.
 
     stalagmite-gui
 
-Opens http://127.0.0.1:8757 in your browser with three tabs:
+Opens http://127.0.0.1:8757 in your browser with four tabs:
   * Audit    - drop an STL, get the full interactive 3D report
   * Orient   - find a better build orientation, download the rotated STL
   * Compare  - drop two revisions, see what your change fixed / broke
+  * Batch    - drop MANY parts, get the audit table (GUI stalagmite-batch)
+
+The report viewer also carries Stage D: "Patch source" downloads the
+repairs as OpenSCAD / CadQuery code to paste into the original design,
+with the parametric preview re-audit verdict shown honestly.
 
 The server is localhost-only; nothing leaves your machine. All three
 tabs run the same tested Python behind dfam_audit / dfam_orient /
@@ -223,6 +228,69 @@ def run_diff(old_raw, old_name, new_raw, new_name, profile_name, auto_ex):
                 pass
 
 
+def run_batch_row(raw, name, profile_name, auto_ex):
+    """Bytes -> one batch-table row dict (the GUI's stalagmite-batch)."""
+    import time
+    import dfam_profiles
+    import stalagmite
+    profile = dfam_profiles.resolve(profile_name or None)
+    path = _tmp_write(raw, name)
+    try:
+        t0 = time.time()
+        r = stalagmite.check(path, profile=profile, auto_ex=auto_ex,
+                             suggest=False)
+        return {"ok": True, "file": os.path.basename(name),
+                "status": r.status, "fails": r.fails,
+                "judge": r.count("judge"),
+                "tolerable": r.count("tolerable"),
+                "exit_code": r.exit_code,
+                "seconds": round(time.time() - t0, 1)}
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def run_patch(raw, name, profile_name, auto_ex, lang="openscad", keep=()):
+    """Bytes -> Stage D patch source dict: emitted text + the honest
+    parametric-preview verdict (same engine as stalagmite-patch)."""
+    import dfam_profiles
+    import stalagmite
+    import dfam_patch as P
+    profile = dfam_profiles.resolve(profile_name or None)
+    if lang not in P.EMITTERS:
+        return {"ok": False, "error": f"unknown language: {lang}"}
+    path = _tmp_write(raw, name)
+    try:
+        r = stalagmite.check(path, profile=profile, auto_ex=auto_ex,
+                             keep=keep, suggest=False)
+        params, blocked = P.fix_params(
+            r.mesh, r.features, profile.dz, profile.angle, keep=keep,
+            avoid=r.exclude, ledge_max=profile.ledge_max)
+        if not params and not blocked and r.fails == 0:
+            return {"ok": True, "nothing": True, "fixes": 0, "blocked": 0}
+        verdict = after_status = None
+        if params:
+            verdict, after, _ = P.verify_params(r, params, profile)
+            after_status = after.status
+        emit, ext = P.EMITTERS[lang]
+        stem = os.path.splitext(os.path.basename(name))[0]
+        text = emit(params, blocked,
+                    {"part": os.path.basename(name),
+                     "profile": profile.summary_line()})
+        return {"ok": True, "nothing": False, "text": text,
+                "fname": stem + "_patch" + ext, "lang": lang,
+                "fixes": len(params), "blocked": len(blocked),
+                "verdict": verdict, "after_status": after_status,
+                "warnings": [w for p2 in params for w in p2["warnings"]]}
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 def _landing():
     import dfam_profiles
     opts = "".join(f'<option value="{html.escape(k)}">{html.escape(k)}'
@@ -302,6 +370,25 @@ class Handler(BaseHTTPRequestHandler):
                               q.get("auto_ex", ["1"])[0] == "1",
                               parse_keep(q.get("keep", [])),
                               json.loads(q.get("sculpt", ["[]"])[0]))
+                self._send(200, json.dumps(out), JSON)
+            elif p == "/batchrow":
+                if not raw:
+                    self._send(200, _err_json("File missing."), JSON)
+                    return
+                out = run_batch_row(raw, q.get("name", ["part.stl"])[0],
+                                    q.get("profile", [""])[0],
+                                    q.get("auto_ex", ["1"])[0] == "1")
+                self._send(200, json.dumps(out), JSON)
+            elif p == "/patch":
+                if not raw:
+                    self._send(200, _err_json("File missing."), JSON)
+                    return
+                from dfam_intent import parse_keep
+                out = run_patch(raw, q.get("name", ["part.stl"])[0],
+                                q.get("profile", [""])[0],
+                                q.get("auto_ex", ["1"])[0] == "1",
+                                q.get("lang", ["openscad"])[0],
+                                parse_keep(q.get("keep", [])))
                 self._send(200, json.dumps(out), JSON)
             elif p == "/diff":
                 obj = json.loads(raw.decode())
@@ -425,6 +512,14 @@ _LANDING = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
   .t-NEW,.t-NEWFAIL{color:var(--fail);font-weight:700}
   .t-PERSISTS{color:var(--dim);font-weight:700}
   .foot{color:var(--dim);font-size:12px;margin-top:18px;text-align:center}
+  table.btab{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px}
+  .btab th{color:var(--dim);font-weight:400;text-align:left;padding:3px 6px;
+       border-bottom:1px solid var(--line);font-size:12px}
+  .btab td{padding:5px 6px;border-bottom:1px solid var(--line)}
+  .rowbtn{margin:0;width:auto;padding:4px 10px;font-size:12px;
+       background:transparent;border:1px solid var(--acc);color:var(--acc);
+       border-radius:7px;font-weight:700}
+  #v-lang{width:auto;padding:6px 8px;font-size:12px}
 </style></head><body><div class="wrap">
   <header>
     <img src="__LOGO__" alt="STALAGMITE — The transition IS the design"
@@ -437,6 +532,7 @@ _LANDING = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
     <div class="tab on" data-t="audit">Audit</div>
     <div class="tab" data-t="orient">Orient</div>
     <div class="tab" data-t="compare">Compare</div>
+    <div class="tab" data-t="batch">Batch</div>
   </div>
 
   <!-- AUDIT -->
@@ -492,6 +588,20 @@ _LANDING = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
     <div class="res" id="res-cmp"></div>
   </div>
 
+  <!-- BATCH -->
+  <div class="pane" id="p-batch">
+    <div class="drop" id="d-batch"><b>Drop a whole batch of parts</b><br>
+      <small>select or drop MULTIPLE files &middot; each is audited in turn</small>
+      <div class="fn" id="fn-batch"></div></div>
+    <div class="row">
+      <div class="fld"><label>Process profile</label>
+        <select id="prof-batch">__PROFILE_OPTS__</select></div>
+      <label class="chk"><input type="checkbox" id="ax-batch" checked> Auto-detect threads</label>
+    </div>
+    <button id="go-batch" disabled>Audit all</button>
+    <div class="res" id="res-batch"></div>
+  </div>
+
   <p class="foot">Runs locally on your machine. Nothing is uploaded.</p>
 </div>
 <div id="viewer">
@@ -500,6 +610,10 @@ _LANDING = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
     <span id="v-verdict" style="font-size:13px;color:var(--dim)"></span>
     <span class="vsp"></span>
     <a id="v-dlstl" class="vbtn" style="display:none">Download fixed STL</a>
+    <select id="v-lang" title="patch source language">
+      <option value="openscad">OpenSCAD</option>
+      <option value="cadquery">CadQuery</option></select>
+    <button id="v-patch" class="vbtn" style="background:transparent">Patch source</button>
     <button id="v-fix">Auto-fix &amp; re-audit</button>
     <a id="v-open" class="vbtn" target="_blank">Open in new tab</a>
     <a id="v-dl" class="vbtn">Download report</a>
@@ -529,25 +643,30 @@ function dz(dropId, fnId, cb){
 function b64(buf){ let s='',a=new Uint8Array(buf); for(let i=0;i<a.length;i++) s+=String.fromCharCode(a[i]); return btoa(s); }
 
 // ---- AUDIT
-let fAudit=null;
+let fAudit=null, vProf='', vAx=true;   // viewer context (audit OR batch row)
+async function openReport(f, prof, ax, sg){
+  fAudit=f; vProf=prof; vAx=ax;
+  const buf=await f.arrayBuffer();
+  const qs=new URLSearchParams({name:f.name, profile:prof,
+    auto_ex:ax?'1':'0', suggest:sg?'1':'0'});
+  const r=await fetch('/audit?'+qs,{method:'POST',body:buf});
+  const t=await r.text();
+  const url=URL.createObjectURL(new Blob([t],{type:'text/html'}));
+  const name=f.name.replace(/\.[^.]+$/,'')+'_report.html';
+  document.getElementById('vframe').src=url;
+  document.getElementById('v-open').href=url;
+  const dl=document.getElementById('v-dl'); dl.href=url; dl.download=name;
+  document.getElementById('viewer').style.display='flex';
+}
 dz('d-audit','fn-audit', f=>{ fAudit=f; document.getElementById('go-audit').disabled=false; });
 document.getElementById('go-audit').onclick = async () => {
   if(!fAudit) return;
   const go=document.getElementById('go-audit'); go.disabled=true;
   document.getElementById('busy-audit').style.display='block';
-  const buf=await fAudit.arrayBuffer();
-  const qs=new URLSearchParams({name:fAudit.name,
-    profile:document.getElementById('prof-audit').value,
-    auto_ex:document.getElementById('ax-audit').checked?'1':'0',
-    suggest:document.getElementById('sg-audit').checked?'1':'0'});
-  const r=await fetch('/audit?'+qs,{method:'POST',body:buf});
-  const t=await r.text();
-  const url=URL.createObjectURL(new Blob([t],{type:'text/html'}));
-  const name=fAudit.name.replace(/\.[^.]+$/,'')+'_report.html';
-  document.getElementById('vframe').src=url;
-  document.getElementById('v-open').href=url;
-  const dl=document.getElementById('v-dl'); dl.href=url; dl.download=name;
-  document.getElementById('viewer').style.display='flex';
+  await openReport(fAudit,
+    document.getElementById('prof-audit').value,
+    document.getElementById('ax-audit').checked,
+    document.getElementById('sg-audit').checked);
   document.getElementById('busy-audit').style.display='none';
   go.disabled=false;
 };
@@ -587,8 +706,7 @@ document.getElementById('v-fix').onclick = async () => {
   vd.textContent='fixing: building repairs, unioning, re-auditing ...';
   const buf=await fAudit.arrayBuffer();
   const qs=new URLSearchParams({name:fAudit.name,
-    profile:document.getElementById('prof-audit').value,
-    auto_ex:document.getElementById('ax-audit').checked?'1':'0'});
+    profile:vProf, auto_ex:vAx?'1':'0'});
   vKeep.forEach(z=>qs.append('keep', z.join(':')));
   if(vSculpt.length) qs.set('sculpt', JSON.stringify(vSculpt));
   try {
@@ -626,6 +744,100 @@ document.getElementById('v-fix').onclick = async () => {
     }
   } catch(e){ vd.textContent='fix error: '+e; }
   vb.disabled=false;
+};
+
+// ---- PATCH SOURCE (Stage D: the fix as design code)
+document.getElementById('v-patch').onclick = async () => {
+  if(!fAudit) return;
+  const vb=document.getElementById('v-patch'); vb.disabled=true;
+  const vd=document.getElementById('v-verdict');
+  vd.textContent='emitting patch source + parametric preview re-audit ...';
+  try {
+    const qs=new URLSearchParams({name:fAudit.name, profile:vProf,
+      auto_ex:vAx?'1':'0',
+      lang:document.getElementById('v-lang').value});
+    vKeep.forEach(z=>qs.append('keep', z.join(':')));
+    const r=await fetch('/patch?'+qs,{method:'POST',
+      body:await fAudit.arrayBuffer()});
+    const j=await r.json();
+    if(!j.ok){ vd.textContent='patch error: '+(j.error||'unknown'); vb.disabled=false; return; }
+    if(j.nothing){ vd.textContent='nothing to patch — no fail defects'; vb.disabled=false; return; }
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(new Blob([j.text],{type:'text/plain'}));
+    a.download=j.fname; document.body.appendChild(a); a.click(); a.remove();
+    vd.innerHTML='patch source '+j.fname+': '+j.fixes+' fix(es), '
+      +j.blocked+' blocked'
+      +(j.verdict?' &middot; preview <b style="color:'
+        +(j.verdict==='VERIFIED'?'#3fb96a'
+          :j.verdict==='PARTIAL'?'#f08c14':'#9aa4b2')+'">'
+        +j.verdict+'</b> ('+j.after_status+')':'')
+      +' &middot; paste into your ORIGINAL design, re-export, re-audit';
+  } catch(e){ vd.textContent='patch error: '+e; }
+  vb.disabled=false;
+};
+
+// ---- BATCH
+let fBatch=[];
+(function(){
+  const d=document.getElementById('d-batch'),
+        fn=document.getElementById('fn-batch');
+  const inp=document.createElement('input');
+  inp.type='file'; inp.multiple=true;
+  inp.accept='.stl,.obj,.ply,.3mf'; inp.style.display='none';
+  document.body.appendChild(inp);
+  d.onclick=()=>inp.click();
+  const set=fs=>{
+    fBatch=[...fs].filter(f=>/\.(stl|obj|ply|3mf)$/i.test(f.name));
+    fn.textContent=fBatch.length+' file(s) selected';
+    document.getElementById('go-batch').disabled=!fBatch.length;
+  };
+  inp.onchange=()=>set(inp.files);
+  ['dragover','dragenter'].forEach(e=>d.addEventListener(e,ev=>{ev.preventDefault();d.classList.add('hot');}));
+  ['dragleave','drop'].forEach(e=>d.addEventListener(e,ev=>{ev.preventDefault();d.classList.remove('hot');}));
+  d.addEventListener('drop',ev=>{ if(ev.dataTransfer.files.length) set(ev.dataTransfer.files); });
+})();
+document.getElementById('go-batch').onclick = async () => {
+  const go=document.getElementById('go-batch'); go.disabled=true;
+  const res=document.getElementById('res-batch'); res.style.display='block';
+  res.innerHTML='<h3>Batch audit</h3><table class="btab" id="btab">'+
+    '<tr><th>status</th><th>part</th><th>fail</th><th>judge</th>'+
+    '<th>tol</th><th>sec</th><th></th></tr></table>'+
+    '<div class="sub" id="bsum" style="margin-top:8px"></div>';
+  const prof=document.getElementById('prof-batch').value;
+  const ax=document.getElementById('ax-batch').checked;
+  const counts={};
+  const sum=()=>{ document.getElementById('bsum').textContent=
+    'summary: '+Object.entries(counts).map(([k,v])=>v+'× '+k.replace(/_/g,' ')).join(', '); };
+  for(const f of fBatch){
+    const row=document.createElement('tr');
+    row.innerHTML='<td colspan="7" class="sub">auditing '+f.name+' …</td>';
+    document.getElementById('btab').appendChild(row);
+    try {
+      const qs=new URLSearchParams({name:f.name, profile:prof,
+        auto_ex:ax?'1':'0'});
+      const r=await fetch('/batchrow?'+qs,{method:'POST',
+        body:await f.arrayBuffer()});
+      const j=await r.json();
+      if(!j.ok) throw new Error(j.error||'audit failed');
+      counts[j.status]=(counts[j.status]||0)+1;
+      row.innerHTML='<td><span class="statusbadge b-'+j.status+'">'
+        +j.status.replace(/_/g,' ')+'</span></td>'
+        +'<td>'+f.name+'</td><td>'+j.fails+'</td><td>'+j.judge
+        +'</td><td>'+j.tolerable+'</td><td>'+j.seconds+'</td>'
+        +'<td><button class="rowbtn">report</button></td>';
+      row.querySelector('.rowbtn').onclick=async ev=>{
+        ev.target.textContent='opening…'; ev.target.disabled=true;
+        await openReport(f, prof, ax, true);
+        ev.target.textContent='report'; ev.target.disabled=false;
+      };
+    } catch(e){
+      counts.ERROR=(counts.ERROR||0)+1;
+      row.innerHTML='<td><span class="statusbadge b-FAIL">ERROR</span></td>'
+        +'<td>'+f.name+'</td><td colspan="5" class="sub">'+e+'</td>';
+    }
+    sum();
+  }
+  go.disabled=false;
 };
 
 // ---- ORIENT
